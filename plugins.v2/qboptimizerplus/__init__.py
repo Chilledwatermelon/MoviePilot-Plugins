@@ -36,7 +36,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1892,6 +1892,8 @@ class QbOptimizerPlus(_PluginBase):
 
     # 正在下载的种子在选择时的加权，避免为了微小收益来回暂停/恢复
     RUNNING_BONUS = 1.2
+    # 正在下载的种子额外加分（MB/s），避免两个都没速度的种子每轮互换；等待补偿约半小时后才会超过它，实现轮换试速
+    RUNNING_MARGIN = 0.5
     # 被暂停的种子每等待1小时增加的价值（相当于MB/s），保证慢种子最终也能轮到并下载完
     WAIT_CREDIT_PER_HOUR = 1.0
 
@@ -2021,7 +2023,7 @@ class QbOptimizerPlus(_PluginBase):
             # 没有速度数据的种子给一个很小的价值，让剩余预算可以分给它们去试速度
             value = speed + record['credit'] + 0.001 * min(self._get_seeder_count(torrent), 100) + 0.0001
             if is_running:
-                value *= self.RUNNING_BONUS
+                value = value * self.RUNNING_BONUS + self.RUNNING_MARGIN
             # qB 开启预分配时，启动过的种子已经占好了磁盘空间，继续下载不再消耗剩余空间
             weight = 0.0 if preallocate and self._first_int_attr(torrent, ['time_active']) > 0 else remaining
             keep_reason = self._get_exclude_reason(torrent)
