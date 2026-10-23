@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 from datetime import datetime, timedelta
@@ -35,7 +36,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1835,8 +1836,14 @@ class QbOptimizerPlus(_PluginBase):
             return False
 
     def _manage_download_threshold(self, downloader_obj, torrents, downloader_name):
+        """
+        下载阈值控制：在“剩余空间 - 最小阈值”的预算内，选出总下载速度最大的一组种子同时下载
+        （0/1背包：重量=剩余需下载大小，价值=平滑下载速度），其余暂停；空间富余时按同一规则恢复。
+        只恢复本插件暂停过的种子。
+        """
+        prefix = "【功能5-下载阈值控制】"
         if not self._enable_download_threshold:
-            logger.info("【功能5-下载阈值控制】下载阈值控制功能已禁用，跳过")
+            logger.info(f"{prefix}功能已禁用，跳过")
             return False
         try:
             stored = self.get_data('threshold_paused')
@@ -1847,435 +1854,225 @@ class QbOptimizerPlus(_PluginBase):
             stored = [t.hash for t in torrents
                       if getattr(t, 'progress', 0) < 1
                       and any(k in (getattr(t, 'state', '') or '').lower() for k in ('stopped', 'paused'))]
-            logger.info(f"【功能5-下载阈值控制】首次建立暂停记录，接管{len(stored)}个当前暂停的未完成种子")
+            logger.info(f"{prefix}首次建立暂停记录，接管{len(stored)}个当前暂停的未完成种子")
         paused_by_plugin = set(stored)
         try:
-            return self._manage_download_threshold_core(downloader_obj, torrents, downloader_name, paused_by_plugin)
-        finally:
-            try:
-                self.save_data('threshold_paused', list(paused_by_plugin))
-            except Exception as e:
-                logger.debug(f"【功能5-下载阈值控制】保存暂停记录失败: {e}")
-
-    def _manage_download_threshold_core(self, downloader_obj, torrents, downloader_name, paused_by_plugin: set):
-        """
-        下载阈值控制管理：如果当前下载中的种子总大小超过阈值，直接暂停任务保持不超过阈值
-        1. 计算所有下载中种子的总大小（只计算需要下载的文件，优先级不为0）
-        2. 如果总大小超过阈值，优先暂停当前下载速度慢、下载进度低的种子，直到总大小不超过阈值
-        3. 如果总大小未超过阈值，按下载速度从快到慢恢复暂停的种子，但不能超过阈值
-        """
-        logger.info(f"【功能5-下载阈值控制】开始下载阈值控制管理，功能开关: {self._enable_download_threshold}")
-        
-        if not self._enable_download_threshold:
-            logger.info("【功能5-下载阈值控制】下载阈值控制功能已禁用，跳过")
-            return False
-        
+            speed_ema = dict(self.get_data('speed_ema') or {})
+            wait_credit = dict(self.get_data('wait_credit') or {})
+            oversize_notified = set(self.get_data('oversize_notified') or [])
+        except Exception:
+            speed_ema, wait_credit, oversize_notified = {}, {}, set()
         try:
-            # 获取qBittorrent客户端实例
-            qb_client = downloader_obj.qbc
-            if not qb_client:
-                logger.error("【功能5-下载阈值控制】无法获取qBittorrent客户端")
-                return False
-            
-            # 获取当前磁盘空间
-            try:
-                response = qb_client._request(
-                    http_method='POST',
-                    api_namespace='sync',
-                    api_method='maindata',
-                    data={'rid': 0}
-                )
-                
-                try:
-                    response_data = response.json()
-                except:
-                    import json
-                    response_data = json.loads(response.text)
-                
-                if 'server_state' not in response_data:
-                    logger.warning(f"【功能5-下载阈值控制】无法获取服务器状态信息")
-                    return False
-                
-                server_state = response_data['server_state']
-                free_space_gb = server_state.get('free_space_on_disk', 0) / (1024**3)  # 转换为GB
-                
-                logger.info(f"【功能5-下载阈值控制】当前磁盘剩余空间: {free_space_gb:.2f}GB, 最小阈值: {self._min_disk_space_threshold}GB")
-                
-            except Exception as e:
-                logger.error(f"【功能5-下载阈值控制】获取磁盘空间失败: {str(e)}")
-                return False
-            
-            # 只恢复本插件暂停过的种子，不动用户手动暂停的种子；已不存在的种子从记录中清除
-            paused_by_plugin.intersection_update({t.hash for t in torrents})
-
-            # 筛选下载中的种子和暂停的种子
-            downloading_torrents = []  # 正在下载的种子
-            paused_torrents = []      # 本插件暂停的种子
-            
-            # 用于调试：统计所有状态
-            state_counter = {}
-            
-            for torrent in torrents:
-                progress = getattr(torrent, 'progress', 0)
-                if progress >= 1.0:
-                    continue  # 跳过已完成的种子
-                
-                state_name = getattr(torrent, 'state', '') or ''
-                state_lower = state_name.lower()
-                
-                # 统计状态用于调试
-                state_counter[state_name] = state_counter.get(state_name, 0) + 1
-                
-                # 首先检测暂停状态（优先级最高，避免被误判为下载中）
-                # stoppedDL = 暂停下载, stoppedUP = 暂停上传, paused = 暂停
-                is_paused = (state_lower == 'stoppeddl' or 
-                           state_lower == 'stoppedup' or
-                           state_lower == 'pauseddl' or
-                           state_lower == 'pausedup' or
-                           state_lower == 'paused' or
-                           'stopped' in state_lower or
-                           'paused' in state_lower)
-                
-                if is_paused:
-                    if torrent.hash in paused_by_plugin:
-                        paused_torrents.append(torrent)
-                    continue
-                
-                # 检测下载中的种子：优先使用 state_enum（更可靠）
-                is_downloading = False
-                try:
-                    if hasattr(torrent, 'state_enum'):
-                        is_downloading = torrent.state_enum.is_downloading
-                except Exception:
-                    pass
-                
-                # 如果 state_enum 不可用，使用字符串匹配
-                # 注意：排除 stoppedDL 等暂停状态
-                if not is_downloading and not is_paused:
-                    is_downloading = (state_lower == 'downloading' or 
-                                    state_lower == 'stalleddl' or 
-                                    state_lower == 'metadl' or
-                                    state_lower == 'queueddl')
-                
-                # 检测做种中的种子
-                is_uploading = False
-                try:
-                    if hasattr(torrent, 'state_enum'):
-                        is_uploading = torrent.state_enum.is_uploading
-                except Exception:
-                    pass
-                
-                if not is_uploading and not is_paused:
-                    is_uploading = (state_lower == 'uploading' or 
-                                  state_lower == 'stalledup' or 
-                                  state_lower == 'queuedup')
-                
-                # error/missingFiles/checking 等其它状态不处理，避免把异常种子当成暂停种子恢复
-                if is_downloading:
-                    downloading_torrents.append(torrent)
-            
-            # 输出状态统计用于调试
-            logger.info(f"【功能5-下载阈值控制】种子状态统计: {dict(sorted(state_counter.items(), key=lambda x: x[1], reverse=True)[:10])}")
-            logger.info(f"【功能5-下载阈值控制】发现 {len(downloading_torrents)} 个下载中的种子, {len(paused_torrents)} 个暂停的种子")
-            
-            # 如果检测到暂停的种子，输出前几个的详细信息用于调试
-            if paused_torrents:
-                logger.debug(f"【功能5-下载阈值控制】暂停种子详情（前5个）:")
-                for i, torrent in enumerate(paused_torrents[:5], 1):
-                    state_name = getattr(torrent, 'state', '') or ''
-                    progress = getattr(torrent, 'progress', 0)
-                    dlspeed = getattr(torrent, 'dlspeed', 0)
-                    logger.debug(f"  {i}. {getattr(torrent, 'name', 'Unknown')} | 状态: {state_name} | 进度: {progress*100:.1f}% | 速度: {dlspeed}")
-            
-            # 收集所有下载中种子的文件信息（只计算需要下载的文件，优先级不为0）
-            downloading_torrent_info = []
-            
-            for torrent in downloading_torrents:
-                torrent_hash = getattr(torrent, 'hash', '')
-                torrent_name = getattr(torrent, 'name', 'Unknown')
-                
-                try:
-                    # 获取种子文件列表
-                    files = downloader_obj.get_files(tid=torrent_hash)
-                    if not files:
-                        logger.debug(f"【功能5-下载阈值控制】无法获取种子文件列表: {torrent_name}")
-                        continue
-                    
-                    # 计算该种子需要下载的文件总大小
-                    torrent_remaining_size = 0
-                    for file in files:
-                        # 获取文件优先级，如果为0则跳过（不下载的文件）
-                        file_priority = getattr(file, 'priority', 0)
-                        if file_priority == 0:
-                            continue  # 跳过不下载的文件
-                        
-                        file_progress = getattr(file, 'progress', 0)
-                        if file_progress >= 1.0:
-                            continue  # 跳过已完成的文件
-                        
-                        file_size = getattr(file, 'size', 0)
-                        remaining_size = file_size * (1 - file_progress)
-                        torrent_remaining_size += remaining_size
-                    
-                    if torrent_remaining_size > 0:
-                        dlspeed = getattr(torrent, 'dlspeed', 0)
-                        progress = getattr(torrent, 'progress', 0)
-                        downloading_torrent_info.append({
-                            'torrent': torrent,
-                            'torrent_hash': torrent_hash,
-                            'torrent_name': torrent_name,
-                            'remaining_size': torrent_remaining_size,
-                            'dlspeed': dlspeed,
-                            'dlspeed_mbps': dlspeed / (1024 * 1024),  # 转换为MB/s
-                            'progress': progress,
-                            'progress_percent': progress * 100
-                        })
-                    
-                except Exception as e:
-                    logger.warning(f"【功能5-下载阈值控制】处理种子文件异常: {torrent_name}, 错误: {str(e)}")
-                    continue
-            
-            # 计算所有下载中种子的总剩余大小
-            if downloading_torrent_info:
-                total_remaining_size = sum(t['remaining_size'] for t in downloading_torrent_info)
-                total_remaining_gb = total_remaining_size / (1024**3)
-                estimated_free_space = free_space_gb - total_remaining_gb
-                
-                logger.info(f"【功能5-下载阈值控制】下载中种子总数: {len(downloading_torrent_info)}")
-                logger.info(f"【功能5-下载阈值控制】预计下载空间（仅计算需要下载的文件）: {total_remaining_gb:.2f}GB")
-                logger.info(f"【功能5-下载阈值控制】预计剩余空间: {estimated_free_space:.2f}GB")
-            else:
-                # 没有下载中的种子，预计剩余空间就是当前剩余空间
-                total_remaining_gb = 0
-                estimated_free_space = free_space_gb
-                
-                logger.info(f"【功能5-下载阈值控制】没有下载中的种子")
-                logger.info(f"【功能5-下载阈值控制】预计下载空间: 0GB")
-                logger.info(f"【功能5-下载阈值控制】预计剩余空间（当前剩余空间）: {estimated_free_space:.2f}GB")
-                
-                # 如果没有暂停的种子，直接返回
-                if not paused_torrents:
-                    logger.info(f"【功能5-下载阈值控制】没有暂停的种子，无需调整")
-                    return False
-                
-                # 如果有暂停的种子，继续执行恢复逻辑（跳过暂停逻辑，直接到恢复逻辑）
-                logger.info(f"【功能5-下载阈值控制】有暂停的种子，检查是否可以恢复")
-            
-            # 如果预计剩余空间小于最小阈值，需要暂停部分种子
-            if estimated_free_space < self._min_disk_space_threshold:
-                # 如果没有下载中的种子，无法暂停，直接返回
-                if not downloading_torrent_info:
-                    logger.warning(f"【功能5-下载阈值控制】预计剩余空间({estimated_free_space:.2f}GB) < 最小阈值({self._min_disk_space_threshold}GB)，但没有下载中的种子可以暂停")
-                    return False
-                
-                logger.warning(f"【功能5-下载阈值控制】预计剩余空间({estimated_free_space:.2f}GB) < 最小阈值({self._min_disk_space_threshold}GB)，开始暂停种子")
-                
-                # 保留优先级：当前下载速度高的优先不暂停；速度相同时，下载进度高的优先不暂停。
-                # 因此暂停顺序为：速度低 -> 进度低 -> 剩余空间大。
-                downloading_torrent_info.sort(
-                    key=lambda x: (x['dlspeed_mbps'], x['progress'], -x['remaining_size'])
-                )
-                
-                # 计算需要暂停的总大小
-                space_shortage_gb = self._min_disk_space_threshold - estimated_free_space
-                space_shortage_bytes = space_shortage_gb * (1024**3)
-                
-                logger.info(f"【功能5-下载阈值控制】空间不足: {space_shortage_gb:.2f}GB，需要暂停种子释放空间")
-                
-                paused_count = 0
-                paused_size = 0
-                
-                # 从慢到快暂停种子，直到总大小不超过阈值
-                for torrent_info in downloading_torrent_info:
-                    if paused_size >= space_shortage_bytes:
-                        break  # 已经暂停足够多的种子
-                    
-                    torrent = torrent_info['torrent']
-                    torrent_hash = torrent_info['torrent_hash']
-                    torrent_name = torrent_info['torrent_name']
-                    remaining_size = torrent_info['remaining_size']
-                    dlspeed_mbps = torrent_info['dlspeed_mbps']
-                    progress_percent = torrent_info['progress_percent']
-                    
-                    try:
-                        # 暂停种子
-                        result = downloader_obj.stop_torrents(ids=[torrent_hash])
-                        
-                        if result:
-                            logger.info(f"【功能5-下载阈值控制】暂停种子成功: {torrent_name} (速度: {dlspeed_mbps:.2f}MB/s, 进度: {progress_percent:.1f}%, 剩余: {StringUtils.str_filesize(remaining_size)})")
-                            paused_by_plugin.add(torrent_hash)
-                            paused_count += 1
-                            paused_size += remaining_size
-                        else:
-                            logger.warning(f"【功能5-下载阈值控制】暂停种子失败: {torrent_name}")
-                            
-                    except Exception as e:
-                        logger.error(f"【功能5-下载阈值控制】暂停种子异常: {torrent_name}, 错误: {str(e)}")
-                
-                logger.info(f"【功能5-下载阈值控制】暂停完成: 暂停 {paused_count} 个种子，释放空间: {StringUtils.str_filesize(paused_size)}")
-                
-                # 发送通知
-                if self._notify and paused_count > 0:
-                    notification_title = "【QB种子优化】下载阈值控制已暂停种子"
-                    notification_text = f"当前磁盘剩余空间: {free_space_gb:.2f}GB\n"
-                    notification_text += f"预计下载空间: {total_remaining_gb:.2f}GB\n"
-                    notification_text += f"预计剩余空间: {estimated_free_space:.2f}GB\n"
-                    notification_text += f"最小阈值: {self._min_disk_space_threshold}GB\n"
-                    notification_text += f"空间不足: {space_shortage_gb:.2f}GB\n"
-                    notification_text += f"\n已暂停 {paused_count} 个低速低进度的种子，释放空间: {StringUtils.str_filesize(paused_size)}\n"
-                    notification_text += f"确保磁盘空间不会超过阈值"
-                    
-                    self.post_message(
-                        mtype=NotificationType.Manual,
-                        title=notification_title,
-                        text=notification_text
-                    )
-                
-                return paused_count > 0
-            else:
-                # 预计剩余空间 >= 最小阈值，可以尝试恢复暂停的种子
-                logger.info(f"【功能5-下载阈值控制】预计剩余空间({estimated_free_space:.2f}GB) >= 最小阈值({self._min_disk_space_threshold}GB)，检查是否可以恢复暂停的种子")
-                
-                if not paused_torrents:
-                    logger.info(f"【功能5-下载阈值控制】没有暂停的种子，无需恢复")
-                    return False
-                
-                # 收集暂停种子的信息
-                paused_torrent_info = []
-                logger.info(f"【功能5-下载阈值控制】开始收集 {len(paused_torrents)} 个暂停种子的信息")
-                
-                for i, torrent in enumerate(paused_torrents, 1):
-                    torrent_hash = getattr(torrent, 'hash', '')
-                    torrent_name = getattr(torrent, 'name', 'Unknown')
-                    
-                    try:
-                        # 获取种子文件列表
-                        files = downloader_obj.get_files(tid=torrent_hash)
-                        if not files:
-                            logger.debug(f"【功能5-下载阈值控制】暂停种子 {i}/{len(paused_torrents)}: {torrent_name} - 无法获取文件列表")
-                            continue
-                        
-                        # 计算该种子需要下载的文件总大小
-                        torrent_remaining_size = 0
-                        for file in files:
-                            file_priority = getattr(file, 'priority', 0)
-                            if file_priority == 0:
-                                continue
-                            
-                            file_progress = getattr(file, 'progress', 0)
-                            if file_progress >= 1.0:
-                                continue
-                            
-                            file_size = getattr(file, 'size', 0)
-                            remaining_size = file_size * (1 - file_progress)
-                            torrent_remaining_size += remaining_size
-                        
-                        if torrent_remaining_size > 0:
-                            # 获取种子之前的下载速度（如果可用）
-                            dlspeed = getattr(torrent, 'dlspeed', 0)
-                            paused_torrent_info.append({
-                                'torrent': torrent,
-                                'torrent_hash': torrent_hash,
-                                'torrent_name': torrent_name,
-                                'remaining_size': torrent_remaining_size,
-                                'dlspeed': dlspeed,
-                                'dlspeed_mbps': dlspeed / (1024 * 1024) if dlspeed > 0 else 0
-                            })
-                            logger.debug(f"【功能5-下载阈值控制】暂停种子 {i}/{len(paused_torrents)}: {torrent_name} - 剩余: {StringUtils.str_filesize(torrent_remaining_size)}, 速度: {dlspeed / (1024 * 1024):.2f}MB/s")
-                        else:
-                            logger.debug(f"【功能5-下载阈值控制】暂停种子 {i}/{len(paused_torrents)}: {torrent_name} - 没有需要下载的文件（所有文件已完成或优先级为0）")
-                    
-                    except Exception as e:
-                        logger.warning(f"【功能5-下载阈值控制】处理暂停种子异常: {torrent_name}, 错误: {str(e)}")
-                        import traceback
-                        logger.debug(f"【功能5-下载阈值控制】异常详情: {traceback.format_exc()}")
-                        continue
-                
-                logger.info(f"【功能5-下载阈值控制】收集完成: 共 {len(paused_torrent_info)} 个暂停种子有需要下载的文件")
-                
-                if not paused_torrent_info:
-                    logger.info(f"【功能5-下载阈值控制】没有需要恢复的暂停种子（所有暂停种子的文件都已完成或优先级为0）")
-                    return False
-                
-                # 按文件大小从小到大排序（小的先恢复），这样可以恢复更多种子
-                # 因为暂停的种子速度都是0，按速度排序没有意义
-                paused_torrent_info.sort(key=lambda x: x['remaining_size'])
-                
-                # 输出前5个待恢复的种子信息
-                logger.info(f"【功能5-下载阈值控制】待恢复种子列表（前5个，按大小从小到大排序）:")
-                for i, t in enumerate(paused_torrent_info[:5], 1):
-                    logger.info(f"  {i}. {t['torrent_name']} | 剩余: {StringUtils.str_filesize(t['remaining_size'])} | 速度: {t['dlspeed_mbps']:.2f}MB/s")
-                
-                # 计算当前预计剩余空间（用于判断恢复后是否超过阈值）
-                logger.info(f"【功能5-下载阈值控制】当前预计剩余空间: {estimated_free_space:.2f}GB, 最小阈值: {self._min_disk_space_threshold}GB")
-                logger.info(f"【功能5-下载阈值控制】可以恢复的种子：恢复后预计剩余空间 >= {self._min_disk_space_threshold}GB")
-                
-                resumed_count = 0
-                resumed_size = 0
-                current_estimated_free_space = estimated_free_space  # 动态跟踪恢复后的预计剩余空间
-                
-                # 从小到大恢复种子（小的先恢复，可以恢复更多种子），但不能超过阈值
-                for i, torrent_info in enumerate(paused_torrent_info, 1):
-                    remaining_size = torrent_info['remaining_size']
-                    torrent_name = torrent_info['torrent_name']
-                    
-                    # 计算恢复这个种子后的预计剩余空间
-                    new_estimated_free_space = current_estimated_free_space - (remaining_size / (1024**3))  # 转换为GB
-                    
-                    # 如果恢复这个种子后，预计剩余空间 < 最小阈值，停止恢复
-                    if new_estimated_free_space < self._min_disk_space_threshold:
-                        logger.info(f"【功能5-下载阈值控制】恢复种子 {i}/{len(paused_torrent_info)}: {torrent_name} - 恢复此种子后预计剩余空间({new_estimated_free_space:.2f}GB) < 最小阈值({self._min_disk_space_threshold}GB)，停止恢复")
-                        break
-                    
-                    torrent_hash = torrent_info['torrent_hash']
-                    dlspeed_mbps = torrent_info['dlspeed_mbps']
-                    
-                    try:
-                        logger.info(f"【功能5-下载阈值控制】恢复种子 {i}/{len(paused_torrent_info)}: {torrent_name} - 尝试恢复（速度: {dlspeed_mbps:.2f}MB/s, 剩余: {StringUtils.str_filesize(remaining_size)}）")
-                        # 恢复种子
-                        result = downloader_obj.start_torrents(ids=[torrent_hash])
-                        
-                        if result:
-                            logger.info(f"【功能5-下载阈值控制】恢复种子成功: {torrent_name} (速度: {dlspeed_mbps:.2f}MB/s, 剩余: {StringUtils.str_filesize(remaining_size)})")
-                            paused_by_plugin.discard(torrent_hash)
-                            resumed_count += 1
-                            resumed_size += remaining_size
-                            # 更新当前预计剩余空间（恢复后，这个种子会变成下载中的）
-                            current_estimated_free_space = new_estimated_free_space
-                            logger.debug(f"【功能5-下载阈值控制】恢复后预计剩余空间更新为: {current_estimated_free_space:.2f}GB")
-                        else:
-                            logger.warning(f"【功能5-下载阈值控制】恢复种子失败: {torrent_name} (API返回False)")
-                            
-                    except Exception as e:
-                        logger.error(f"【功能5-下载阈值控制】恢复种子异常: {torrent_name}, 错误: {str(e)}")
-                        import traceback
-                        logger.debug(f"【功能5-下载阈值控制】异常详情: {traceback.format_exc()}")
-                
-                logger.info(f"【功能5-下载阈值控制】恢复完成: 恢复 {resumed_count} 个种子，占用空间: {StringUtils.str_filesize(resumed_size)}")
-                
-                # 发送通知
-                if self._notify and resumed_count > 0:
-                    notification_title = "【QB种子优化】下载阈值控制已恢复种子"
-                    notification_text = f"当前磁盘剩余空间: {free_space_gb:.2f}GB\n"
-                    notification_text += f"恢复前预计剩余空间: {estimated_free_space:.2f}GB\n"
-                    notification_text += f"恢复后预计剩余空间: {current_estimated_free_space:.2f}GB\n"
-                    notification_text += f"最小阈值: {self._min_disk_space_threshold}GB\n"
-                    notification_text += f"\n已恢复 {resumed_count} 个暂停的种子（按大小从小到大），占用空间: {StringUtils.str_filesize(resumed_size)}\n"
-                    notification_text += f"确保磁盘空间不会超过阈值"
-                    
-                    self.post_message(
-                        mtype=NotificationType.Manual,
-                        title=notification_title,
-                        text=notification_text
-                    )
-                
-                return resumed_count > 0
-                
+            return self._manage_download_threshold_core(downloader_obj, torrents, paused_by_plugin, speed_ema,
+                                                        wait_credit, oversize_notified, prefix)
         except Exception as e:
-            logger.error(f"【功能5-下载阈值控制】下载阈值控制管理异常: {str(e)}")
+            logger.error(f"{prefix}执行异常: {e}")
             import traceback
-            logger.error(f"【功能5-下载阈值控制】异常详情: {traceback.format_exc()}")
+            logger.error(f"{prefix}异常详情: {traceback.format_exc()}")
             return False
+        finally:
+            current = {t.hash for t in torrents}
+            try:
+                self.save_data('threshold_paused', [h for h in paused_by_plugin if h in current])
+                self.save_data('speed_ema', {h: v for h, v in speed_ema.items() if h in current})
+                self.save_data('wait_credit', {h: v for h, v in wait_credit.items() if h in current})
+                self.save_data('oversize_notified', [h for h in oversize_notified if h in current])
+            except Exception as e:
+                logger.debug(f"{prefix}保存记录失败: {e}")
+
+    # 正在下载的种子在选择时的加权，避免为了微小收益来回暂停/恢复
+    RUNNING_BONUS = 1.2
+    # 被暂停的种子每等待1小时增加的价值（相当于MB/s），保证慢种子最终也能轮到并下载完
+    WAIT_CREDIT_PER_HOUR = 1.0
+
+    @staticmethod
+    def _is_downloading_state(torrent) -> bool:
+        state_lower = (getattr(torrent, 'state', '') or '').lower()
+        if any(k in state_lower for k in ('stopped', 'paused')):
+            return False
+        try:
+            if torrent.state_enum.is_downloading:
+                return True
+        except Exception:
+            pass
+        return state_lower in ('downloading', 'stalleddl', 'metadl', 'queueddl', 'forceddl')
+
+    @staticmethod
+    def _is_paused_state(torrent) -> bool:
+        state_lower = (getattr(torrent, 'state', '') or '').lower()
+        return any(k in state_lower for k in ('stopped', 'paused'))
+
+    def _remaining_download_bytes(self, downloader_obj, torrent) -> Optional[float]:
+        """只统计需要下载（优先级不为0）且未完成的文件"""
+        try:
+            files = downloader_obj.get_files(tid=torrent.hash)
+        except Exception as e:
+            logger.debug(f"【功能5-下载阈值控制】获取文件列表失败 {torrent.name}: {e}")
+            return None
+        if not files:
+            return None
+        remaining = 0.0
+        for file in files:
+            if getattr(file, 'priority', 0) == 0:
+                continue
+            progress = getattr(file, 'progress', 0)
+            if progress >= 1.0:
+                continue
+            remaining += getattr(file, 'size', 0) * (1 - progress)
+        return remaining
+
+    @staticmethod
+    def _knapsack_select(items: List[Tuple[str, float, float]], budget_bytes: float) -> set:
+        """
+        0/1背包：items 为 (hash, 重量字节, 价值)，返回总重量不超过预算时价值最大的 hash 集合。
+        重量按单位向上取整，保证选中集合的真实总大小不会超出预算。
+        """
+        if budget_bytes <= 0 or not items:
+            return set()
+        unit = max(256 * 1024 ** 2, budget_bytes / 4000)
+        capacity = int(budget_bytes // unit)
+        weights = [max(1, math.ceil(weight / unit)) for _, weight, _ in items]
+        best = [0.0] * (capacity + 1)
+        take = [bytearray(capacity + 1) for _ in items]
+        for i, (_, _, value) in enumerate(items):
+            w = weights[i]
+            if w > capacity or value <= 0:
+                continue
+            for c in range(capacity, w - 1, -1):
+                candidate = best[c - w] + value
+                if candidate > best[c]:
+                    best[c] = candidate
+                    take[i][c] = 1
+        chosen = set()
+        c = capacity
+        for i in range(len(items) - 1, -1, -1):
+            if take[i][c]:
+                chosen.add(items[i][0])
+                c -= weights[i]
+        return chosen
+
+    def _manage_download_threshold_core(self, downloader_obj, torrents, paused_by_plugin: set, speed_ema: dict,
+                                        wait_credit: dict, oversize_notified: set, prefix: str) -> bool:
+        try:
+            response = downloader_obj.qbc._request(http_method='POST', api_namespace='sync',
+                                                   api_method='maindata', data={'rid': 0})
+            server_state = response.json().get('server_state') or {}
+        except Exception as e:
+            logger.error(f"{prefix}获取磁盘空间失败: {e}")
+            return False
+        free_bytes = float(server_state.get('free_space_on_disk', 0) or 0)
+        if free_bytes <= 0:
+            logger.warning(f"{prefix}未获取到磁盘剩余空间，跳过")
+            return False
+        budget_bytes = free_bytes - self._min_disk_space_threshold * 1024 ** 3
+
+        running, paused = [], []
+        for torrent in torrents:
+            if getattr(torrent, 'progress', 0) >= 1.0:
+                continue
+            if self._is_paused_state(torrent):
+                if torrent.hash in paused_by_plugin:
+                    paused.append(torrent)
+            elif self._is_downloading_state(torrent):
+                running.append(torrent)
+
+        running_hashes = {t.hash for t in running}
+        now = time.time()
+        items = []
+        info = {}
+        oversize = []
+        for torrent in running + paused:
+            remaining = self._remaining_download_bytes(downloader_obj, torrent)
+            if remaining is None or remaining <= 0:
+                continue
+            is_running = torrent.hash in running_hashes
+            if is_running:
+                current = (getattr(torrent, 'dlspeed', 0) or 0) / 1024 ** 2
+                previous = speed_ema.get(torrent.hash)
+                speed = current if previous is None else 0.6 * current + 0.4 * previous
+                speed_ema[torrent.hash] = round(speed, 3)
+            else:
+                speed = speed_ema.get(torrent.hash, 0.0)
+            # 等待补偿：暂停期间按小时累积，恢复后保留到下载完成，避免慢种子永远轮不到
+            record = wait_credit.get(torrent.hash) or {'credit': 0.0, 'ts': now}
+            if not is_running:
+                record['credit'] += self.WAIT_CREDIT_PER_HOUR * max(now - record.get('ts', now), 0) / 3600
+            record['ts'] = now
+            wait_credit[torrent.hash] = {'credit': round(record['credit'], 3), 'ts': now}
+            # 没有速度数据的种子给一个很小的价值，让剩余预算可以分给它们去试速度
+            value = speed + record['credit'] + 0.001 * min(self._get_seeder_count(torrent), 100) + 0.0001
+            if is_running:
+                value *= self.RUNNING_BONUS
+            if remaining > max(budget_bytes, 0):
+                oversize.append((torrent, remaining))
+            items.append((torrent.hash, remaining, value))
+            info[torrent.hash] = (torrent, remaining, speed, is_running)
+
+        total_running = sum(info[h][1] for h in info if info[h][3])
+        logger.info(f"{prefix}剩余空间 {StringUtils.str_filesize(free_bytes)}，最小阈值 {self._min_disk_space_threshold}GB，"
+                    f"可用预算 {StringUtils.str_filesize(max(budget_bytes, 0))}；下载中{len(running)}个"
+                    f"（还需{StringUtils.str_filesize(total_running)}），插件暂停{len(paused)}个")
+        new_oversize = [(t, r) for t, r in oversize if t.hash not in oversize_notified]
+        for torrent, remaining in oversize:
+            logger.warning(f"{prefix}剩余{StringUtils.str_filesize(remaining)}超过可用预算，当前空间下无法下载完成: {torrent.name}")
+        if new_oversize and self._notify:
+            self.post_message(
+                mtype=NotificationType.Manual,
+                title="【QB种子优化Plus】有种子超出可用空间，无法下载完成",
+                text=(f"可用预算: {StringUtils.str_filesize(max(budget_bytes, 0))}（剩余空间减去{self._min_disk_space_threshold}GB阈值）"
+                      + "".join(f"\n- {t.name}（还需 {StringUtils.str_filesize(r)}）" for t, r in new_oversize)
+                      + "\n\n请清理磁盘空间或手动处理这些种子"))
+        oversize_notified.update(t.hash for t, _ in new_oversize)
+        if not items:
+            return False
+
+        if total_running <= budget_bytes and not paused:
+            logger.info(f"{prefix}下载中种子总需求在预算内，无需调整")
+            return False
+
+        chosen = self._knapsack_select(items, budget_bytes)
+        to_pause = [h for h in info if info[h][3] and h not in chosen]
+        to_resume = [h for h in info if not info[h][3] and h in chosen]
+        chosen_size = sum(info[h][1] for h in chosen)
+        chosen_speed = sum(info[h][2] for h in chosen)
+        logger.info(f"{prefix}最优组合: {len(chosen)}个种子，需{StringUtils.str_filesize(chosen_size)}，"
+                    f"预计总速度{chosen_speed:.2f}MB/s；暂停{len(to_pause)}个，恢复{len(to_resume)}个")
+
+        paused_names, resumed_names = [], []
+        for torrent_hash in to_pause:
+            torrent, remaining, speed, _ = info[torrent_hash]
+            try:
+                if downloader_obj.stop_torrents(ids=[torrent_hash]):
+                    paused_by_plugin.add(torrent_hash)
+                    paused_names.append(torrent.name)
+                    logger.info(f"{prefix}暂停: {torrent.name}（平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
+                else:
+                    logger.warning(f"{prefix}暂停失败: {torrent.name}")
+            except Exception as e:
+                logger.error(f"{prefix}暂停异常: {torrent.name}, 错误: {e}")
+        for torrent_hash in to_resume:
+            torrent, remaining, speed, _ = info[torrent_hash]
+            try:
+                if downloader_obj.start_torrents(ids=[torrent_hash]):
+                    paused_by_plugin.discard(torrent_hash)
+                    resumed_names.append(torrent.name)
+                    logger.info(f"{prefix}恢复: {torrent.name}（上次平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
+                else:
+                    logger.warning(f"{prefix}恢复失败: {torrent.name}")
+            except Exception as e:
+                logger.error(f"{prefix}恢复异常: {torrent.name}, 错误: {e}")
+
+        if self._notify and (paused_names or resumed_names):
+            text = (f"剩余空间: {StringUtils.str_filesize(free_bytes)}（最小阈值 {self._min_disk_space_threshold}GB）\n"
+                    f"保留下载: {len(chosen)}个，需 {StringUtils.str_filesize(chosen_size)}，预计 {chosen_speed:.2f}MB/s\n")
+            if paused_names:
+                text += f"\n暂停 {len(paused_names)} 个:\n" + "\n".join(f"- {n}" for n in paused_names[:15])
+                if len(paused_names) > 15:
+                    text += f"\n…等{len(paused_names)}个"
+            if resumed_names:
+                text += f"\n恢复 {len(resumed_names)} 个:\n" + "\n".join(f"- {n}" for n in resumed_names[:15])
+            self.post_message(mtype=NotificationType.Manual, title="【QB种子优化Plus】下载阈值控制已调整", text=text)
+        return bool(paused_names or resumed_names)
 
     def _re_download_torrent(self, torrent_info) -> Tuple[bool, str]:
         """
@@ -3399,7 +3196,7 @@ class QbOptimizerPlus(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '📊 下载阈值控制：当下载中种子总大小超过阈值时，优先保留当前下载速度高的种子；速度相同时，优先保留下载进度高的种子，暂停低速低进度种子以确保磁盘空间不超阈值。当空间充足时，按下载速度从快到慢恢复暂停的种子，但不能超过阈值。只处理需要下载的文件（优先级不为0），跳过不下载的文件（优先级为0）'
+                                            'text': '📊 下载阈值控制：预算 = 磁盘剩余空间 − 最小阈值。在预算内选出总下载速度最大的一组种子同时下载（背包算法，按种子还需下载的大小计算，只算要下载的文件），其余暂停；空间释放后按同一规则恢复。被暂停的种子每等1小时加分，保证慢种子最终也能下载完；正在下载的种子有加权，避免来回切换。单个种子超过整个预算时会通知。只恢复本插件暂停的种子。'
                                         }
                                     }
                                 ]
