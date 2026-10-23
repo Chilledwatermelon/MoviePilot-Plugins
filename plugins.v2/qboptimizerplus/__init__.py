@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10"
+    plugin_version = "1.10.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -124,6 +124,7 @@ class QbOptimizerPlus(_PluginBase):
     _notify_prefix = "QB优化Plus"
     _notify_name_length = 40
     _notify_max_items = 10
+    _notify_compact = True
     _notify_summary_title = ""
     _notify_summary_body = ""
 
@@ -217,6 +218,7 @@ class QbOptimizerPlus(_PluginBase):
             self._notify_prefix = (config.get("notify_prefix") or "QB优化Plus").strip()
             self._notify_name_length = int(config.get("notify_name_length") or 40)
             self._notify_max_items = int(config.get("notify_max_items") or 10)
+            self._notify_compact = bool(config.get("notify_compact", True))
             self._notify_summary_title = config.get("notify_summary_title") or ""
             self._notify_summary_body = config.get("notify_summary_body") or ""
 
@@ -715,6 +717,9 @@ class QbOptimizerPlus(_PluginBase):
     }
     DEFAULT_SUMMARY_TITLE = "🧹 {前缀}｜{摘要}"
     DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}{同步列表}{整理列表}"
+    DEFAULT_SUMMARY_BODY_COMPACT = "💾 剩余 {剩余空间} · ⏰ {时间}\n{替换列表}{保留列表}\n{删除列表}{同步列表}{整理列表}"
+    COMPACT_NAME_LENGTH = 24
+    COMPACT_MAX_ITEMS = 8
 
     class _SafeDict(dict):
         def __missing__(self, key):
@@ -723,6 +728,8 @@ class QbOptimizerPlus(_PluginBase):
     def _short(self, name) -> str:
         name = str(name or '')
         limit = max(self._notify_name_length, 10)
+        if self._notify_compact:
+            limit = min(limit, self.COMPACT_NAME_LENGTH)
         return name if len(name) <= limit else name[:limit - 1] + '…'
 
     def _name(self, name) -> str:
@@ -739,13 +746,42 @@ class QbOptimizerPlus(_PluginBase):
             parts.append(f"分类 {info['category']}")
         return ' · '.join(parts)
 
+    KEY_LINE_MARKS = ('↳', '✗', '原因：', '处理：')
+
+    def _compact_item(self, item: str) -> str:
+        """把多行记录压成一行：名称 + 最关键的一条信息"""
+        lines = [l.strip() for l in str(item).split('\n') if l.strip()]
+        if not lines:
+            return ''
+        head, rest = lines[0], lines[1:]
+        key = next((l for mark in self.KEY_LINE_MARKS for l in rest if l.startswith(mark)), rest[0] if rest else '')
+        if key.startswith('↳'):
+            key = '→ ' + key[1:].strip().split('  ')[0]
+        key = key.replace('原因：', '').replace('处理：', '')
+        if len(key) > 36:
+            key = key[:35] + '…'
+        return f"{head}｜{key}" if key else head
+
+    def _count_or_section(self, header: str, lines: list, short_header: str = None) -> str:
+        """精简模式只给数量，详细模式列出每个种子"""
+        if not lines:
+            return ''
+        if self._notify_compact:
+            return f"{short_header or header} {len(lines)} 个\n"
+        return self._section(header, lines)
+
     def _section(self, header: str, lines: list) -> str:
         if not lines:
             return ''
-        shown = lines[:max(self._notify_max_items, 1)]
+        limit = max(self._notify_max_items, 1)
+        if self._notify_compact:
+            limit = min(limit, self.COMPACT_MAX_ITEMS)
+            lines = [self._compact_item(l) for l in lines]
+            header = header.split('（')[0].split('，')[0]
+        shown = lines[:limit]
         text = f"\n{header}（{len(lines)}）\n" + "\n".join(shown)
         if len(lines) > len(shown):
-            text += f"\n…另有 {len(lines) - len(shown)} 个，详见插件日志"
+            text += f"\n…另有 {len(lines) - len(shown)} 个"
         return text + "\n"
 
     def _render(self, template: str, default: str, values: dict) -> str:
@@ -771,6 +807,10 @@ class QbOptimizerPlus(_PluginBase):
         if not any(events.values()):
             logger.info("【QB种子优化】本次没有替换/保留/删除，无需发送汇总通知")
             return
+        if self._notify_compact and not (events['replaced'] or events['kept'] or events['deleted']):
+            # 精简模式：已整理清理、跳过已整理集数属于日常维护，只记日志不推送
+            logger.info(f"【QB种子优化】日常清理（已整理{len(events['moved'])}个，跳过已整理集数{len(events['synced'])}个），不推送通知")
+            return
         values = {
             '前缀': self._notify_prefix,
             '替换数': len(events['replaced']),
@@ -778,19 +818,20 @@ class QbOptimizerPlus(_PluginBase):
             '删除数': len(events['deleted']),
             '替换列表': self._section("♻️ 已替换为新资源", events['replaced']),
             '保留列表': self._section("⚠️ 未找到替代资源，已保留原种子", events['kept']),
-            '删除列表': self._section("🗑️ 已删除", events['deleted']),
+            '删除列表': self._count_or_section("🗑️ 已删除", events['deleted']),
             '整理数': len(events['moved']),
             '同步数': len(events['synced']),
-            '同步列表': self._section("🔀 季包部分集数已整理，跳过这些文件继续下载", events['synced']),
+            '同步列表': self._count_or_section("🔀 季包部分集数已整理，跳过这些文件继续下载", events['synced'], "🔀 跳过已整理集数"),
             '摘要': ' · '.join(f"{label} {len(events[key])}" for label, key in
                                [('替换', 'replaced'), ('保留', 'kept'), ('删除', 'deleted'), ('跳过已整理文件', 'synced'), ('已整理', 'moved')] if events[key]),
-            '整理列表': self._section("📤 文件已被MP整理移走，清理种子记录", events['moved']),
+            '整理列表': self._count_or_section("📤 文件已被MP整理移走，清理种子记录", events['moved'], "📤 已整理清理"),
             '下载器': ', '.join(self._downloaders),
             '剩余空间': f"{self._last_free_gb:.1f}G" if self._last_free_gb is not None else '未知',
             '时间': datetime.now().strftime('%m-%d %H:%M'),
         }
         title = self._render(self._notify_summary_title, self.DEFAULT_SUMMARY_TITLE, values)
-        body = self._render(self._notify_summary_body, self.DEFAULT_SUMMARY_BODY, values)
+        body = self._render(self._notify_summary_body,
+                            self.DEFAULT_SUMMARY_BODY_COMPACT if self._notify_compact else self.DEFAULT_SUMMARY_BODY, values)
         self._send('summary', title, body)
 
     def _clean_zero_seed_torrents(self, downloader_obj, torrents, downloader_name):
@@ -2891,13 +2932,18 @@ class QbOptimizerPlus(_PluginBase):
             probed_names = []
 
         if paused_names or resumed_names or probed_names:
-            self._send('threshold', f"⚖️ {self._notify_prefix}｜下载调度：暂停 {len(paused_names)} · 恢复 {len(resumed_names)}",
-                       f"💾 剩余 {StringUtils.str_filesize(free_bytes)}｜预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
-                       f"⬇️ 保持下载 {len(chosen)} 个 · 需 {StringUtils.str_filesize(chosen_size)} · 约 {chosen_speed:.1f}MB/s"
-                       + (f"（含 keep {len(keep_hashes)} 个）" if keep_hashes else "") + "\n"
-                       + self._section("⏸ 暂停", paused_names)
-                       + self._section("▶️ 恢复", resumed_names)
-                       + self._section("🔍 新种子试速（空间不够暂未下载）", probed_names))
+            title = f"⚖️ {self._notify_prefix}｜下载调度：暂停 {len(paused_names)} · 恢复 {len(resumed_names)}"
+            if self._notify_compact:
+                body = (f"💾 剩余 {StringUtils.str_filesize(free_bytes)} · 下载 {len(chosen)} 个 · 约 {chosen_speed:.0f}MB/s"
+                        + (f" · 🔍 试速 {len(probed_names)} 个" if probed_names else ""))
+            else:
+                body = (f"💾 剩余 {StringUtils.str_filesize(free_bytes)}｜预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
+                        f"⬇️ 保持下载 {len(chosen)} 个 · 需 {StringUtils.str_filesize(chosen_size)} · 约 {chosen_speed:.1f}MB/s"
+                        + (f"（含 keep {len(keep_hashes)} 个）" if keep_hashes else "") + "\n"
+                        + self._section("⏸ 暂停", paused_names)
+                        + self._section("▶️ 恢复", resumed_names)
+                        + self._section("🔍 新种子试速（空间不够暂未下载）", probed_names))
+            self._send('threshold', title, body)
         return bool(paused_names or resumed_names)
 
     PROBE_NEW_PER_RUN = 10
@@ -3534,6 +3580,22 @@ class QbOptimizerPlus(_PluginBase):
                                         'component': 'VTextField',
                                         'props': {'model': 'notify_max_items', 'label': '每组最多列出',
                                                   'placeholder': '10', 'type': 'number'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'notify_compact',
+                                                  'label': '精简通知（每个种子一行，只保留关键信息）'}
                                     }
                                 ]
                             }
@@ -4703,6 +4765,7 @@ class QbOptimizerPlus(_PluginBase):
             "notify_prefix": "QB优化Plus",
             "notify_name_length": 40,
             "notify_max_items": 10,
+            "notify_compact": True,
             "notify_summary_title": "",
             "notify_summary_body": "",
             # 清理已整理移走的种子
