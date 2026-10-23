@@ -1,4 +1,5 @@
 import asyncio
+import os
 import json
 import math
 import re
@@ -39,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.5"
+    plugin_version = "1.10.7"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -665,7 +666,7 @@ class QbOptimizerPlus(_PluginBase):
                     self._last_free_gb = self._get_free_space_gb(downloader_obj)
 
                     # 执行磁盘空间和I/O监控
-                    disk_monitor_result = self._monitor_disk_and_io(downloader_obj, downloader_name)
+                    disk_monitor_result = self._monitor_disk_and_io(downloader_obj, downloader_name, self._alive(all_torrents))
 
                     # 执行下载阈值控制（优先级调整后状态已变化，重新获取种子列表）
                     fresh_torrents, fresh_error = downloader_obj.get_torrents()
@@ -1976,6 +1977,22 @@ class QbOptimizerPlus(_PluginBase):
     MOVED_RECHECK_INTERVAL = 3600
     MAX_RECHECK_PER_RUN = 2
 
+    @staticmethod
+    def _missing_file_indexes(torrent, files) -> set:
+        """需要下载的文件中，硬盘上已不存在的（含 .!qB 未完成后缀）；保存目录在本机不可见时返回空，避免路径映射不同导致误判"""
+        save_path = getattr(torrent, 'save_path', '') or ''
+        if not save_path or not os.path.isdir(save_path):
+            return set()
+        missing = set()
+        for position, file in enumerate(files or []):
+            if getattr(file, 'priority', 1) == 0:
+                continue
+            name = getattr(file, 'name', '') or ''
+            path = os.path.join(save_path, name)
+            if not (os.path.exists(path) or os.path.exists(path + '.!qB')):
+                missing.add(QbOptimizerPlus._file_index(file, position))
+        return missing
+
     def _sync_moved_files(self, downloader_obj, torrents):
         """
         MP 目录监控+移动：季包下载中途已完成的单集会被移走，qB 之后读这些文件（上传或校验）就会报错。
@@ -2001,9 +2018,10 @@ class QbOptimizerPlus(_PluginBase):
                 logger.debug(f"{prefix}获取文件列表失败 {torrent.name}: {e}")
                 continue
             records = self._get_transfer_records(torrent, files)
-            if not records:
-                continue
-            moved = self._moved_file_indexes(files, records)
+            moved = self._moved_file_indexes(files, records) if records else set()
+            # 曾经下载完成的种子：硬盘上已不存在的文件一律视为已被整理走（整理记录可能已被智能助手删除），不再重新下载
+            if self._first_int_attr(torrent, ['completion_on']) > 0:
+                moved |= self._missing_file_indexes(torrent, files)
             if not moved:
                 continue
             priorities = {self._file_index(f, i): getattr(f, 'priority', 1) for i, f in enumerate(files)}
@@ -2033,8 +2051,10 @@ class QbOptimizerPlus(_PluginBase):
             now_ts = time.time()
             # 整包重新校验要读完整个种子的数据，开销大：报错时立即做，否则同一种子至少间隔1小时
             need_recheck = errored or (moved - already and now_ts - entry.get('recheck_ts', 0) >= self.MOVED_RECHECK_INTERVAL)
+            capped = False
             if need_recheck and rechecks_done >= self.MAX_RECHECK_PER_RUN:
                 need_recheck = False
+                capped = True
                 logger.info(f"{prefix}本轮重新校验已达{self.MAX_RECHECK_PER_RUN}个上限，下轮再校验: {torrent.name}")
             if not to_skip and not need_recheck:
                 continue
@@ -2054,7 +2074,8 @@ class QbOptimizerPlus(_PluginBase):
                 continue
             handled[torrent.hash] = entry
             remaining = [f for i, f in enumerate(files) if self._file_index(f, i) not in moved and getattr(f, 'priority', 1) != 0]
-            action = "设为不下载并重新校验" if need_recheck else "设为不下载（1小时内已校验过，暂不重新校验）"
+            action = ("设为不下载并重新校验" if need_recheck else
+                      "设为不下载（本轮校验名额已满，下轮校验）" if capped else "设为不下载（1小时内已校验过，暂不重新校验）")
             logger.info(f"{prefix}{torrent.name}: 已被MP移走{len(moved)}个文件，{action}，"
                         f"剩余{len(remaining)}个文件继续下载{'（原为报错状态）' if errored else ''}")
             self._events['synced'].append(
@@ -2533,14 +2554,14 @@ class QbOptimizerPlus(_PluginBase):
     # I/O 自适应限速：过载时按当前速度的比例降速，恢复后逐步提速，避免一刀切降到极低速度白白浪费带宽
     IO_LIMIT_FACTOR = 0.6
     IO_LIMIT_MIN_KBPS = 5 * 1024
-    IO_LIMIT_STEP_UP = 1.5
+    IO_LIMIT_STEP_UP = 2.0
     IO_LIMIT_RELEASE_KBPS = 200 * 1024
 
     @staticmethod
     def _fmt_kbps(kbps: float) -> str:
         return f"{kbps / 1024:.1f}MB/s" if kbps >= 1024 else f"{kbps:.0f}KB/s"
 
-    def _monitor_disk_and_io(self, downloader_obj, downloader_name):
+    def _monitor_disk_and_io(self, downloader_obj, downloader_name, torrents=None):
         """
         I/O 监控（自适应限速）：持续监测写入缓存和 I/O 队列，
         过载时把下载限速设为当前实际速度的60%（不低于5MB/s），仍过载继续按比例下调；
@@ -2588,6 +2609,12 @@ class QbOptimizerPlus(_PluginBase):
         load = (f"写入缓存 平均 {data['avg_cache_overload']:.0f}%（阈值 {self._io_cache_threshold}%）\n"
                 f"I/O 队列 平均 {data['avg_io_jobs']:.0f}（阈值 {self._io_queue_threshold}）")
 
+        checking = [t for t in (torrents or []) if 'checking' in (getattr(t, 'state', '') or '').lower()]
+        if should_limit and checking:
+            # 重新校验（重启后或季包校验）产生的是读压力，限制下载速度无济于事，只会白白降速
+            logger.info(f"{prefix}{len(checking)}个种子正在校验，I/O压力主要来自校验，本轮不降速")
+            should_limit = False
+
         if should_limit:
             base = min(io_limit, max(avg_speed_kbps, self.IO_LIMIT_MIN_KBPS)) if io_limit else max(avg_speed_kbps, self.IO_LIMIT_MIN_KBPS)
             target = max(int(base * self.IO_LIMIT_FACTOR), self.IO_LIMIT_MIN_KBPS)
@@ -2612,7 +2639,8 @@ class QbOptimizerPlus(_PluginBase):
         light_load = (data['avg_cache_overload'] < self._io_cache_threshold * 0.5
                       and data['avg_io_jobs'] < self._io_queue_threshold * 0.5)
         target = int(io_limit * self.IO_LIMIT_STEP_UP)
-        if target >= self.IO_LIMIT_RELEASE_KBPS or (light_load and avg_speed_kbps < io_limit * 0.8):
+        # 负载已明显降低（低于阈值一半）直接解除，否则每轮翻倍提速，尽快回到满速
+        if target >= self.IO_LIMIT_RELEASE_KBPS or light_load:
             if not self._set_download_speed_limit(downloader_obj, 0):
                 return False
             state.pop(downloader_name, None)
