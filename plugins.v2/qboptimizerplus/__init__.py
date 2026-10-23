@@ -1,4 +1,7 @@
+import asyncio
+import json
 import math
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -36,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -109,6 +112,13 @@ class QbOptimizerPlus(_PluginBase):
     _redownload_size_tolerance = 50  # 替代资源与原种子大小允许偏差（%），0为不限制
     _redownload_max_attempts = 3     # 同一资源最多自动重新下载次数
 
+    # AI 辅助识别（可选）
+    _ai_enabled = False
+    _ai_model = ""
+    _ai_base_url = ""
+    _ai_api_key = ""
+    _ai_calls_this_run = 0
+
     # qB 中表示“无限”的 ETA 值
     QB_ETA_INFINITY = 8640000
     PROBE_CACHE_TTL = 6 * 3600
@@ -180,6 +190,11 @@ class QbOptimizerPlus(_PluginBase):
             self._redownload_min_seeders = int(config.get("redownload_min_seeders") or 3)
             self._redownload_size_tolerance = int(config.get("redownload_size_tolerance", 50) or 0)
             self._redownload_max_attempts = int(config.get("redownload_max_attempts") or 3)
+
+            self._ai_enabled = bool(config.get("ai_enabled", False))
+            self._ai_model = (config.get("ai_model") or "").strip()
+            self._ai_base_url = (config.get("ai_base_url") or "").strip()
+            self._ai_api_key = (config.get("ai_api_key") or "").strip()
 
             logger.info(f"【QB种子优化】配置加载完成:")
             logger.info(f"  - 启用状态: {self._enabled}")
@@ -564,6 +579,7 @@ class QbOptimizerPlus(_PluginBase):
         total_zero_seed_removed = 0
         total_priority_boosted = 0
         self._current_downloader = None
+        self._ai_calls_this_run = 0
         total_timeout_removed = 0
         total_unrecognized_removed = 0
         all_failed_torrents = []  # 收集所有重新下载失败的种子
@@ -1474,6 +1490,144 @@ class QbOptimizerPlus(_PluginBase):
             logger.debug(f"【QB种子优化】查询下载历史失败 {torrent_hash}: {e}")
             return None
 
+    # ---------------- AI 辅助识别（可选） ----------------
+    AI_MAX_CALLS_PER_RUN = 10
+    AI_CACHE_TTL = 7 * 24 * 3600
+    AI_TIMEOUT = 60
+    AI_PROMPT = (
+        "你是影视资源命名解析助手。根据给出的种子名称，推断它对应的影视作品。"
+        "只输出一个JSON对象，不要输出其它内容，格式："
+        '{"title": "作品中文名或最常用的名称", "original_title": "原名/英文名，没有则为空字符串", '
+        '"year": 首播或上映年份整数，不确定则为null, "type": "movie" 或 "tv", "season": 季号整数，不确定则为null}。'
+        "如果无法判断是什么作品，title 输出空字符串。"
+    )
+
+    def _ai_recognize(self, torrent_name: str) -> Optional[MediaInfo]:
+        """
+        让 AI 根据种子名推测片名、年份、类型，再交给 TMDB 识别核对。
+        AI 只提供线索，必须 TMDB 识别成功才采用；结果按种子名缓存，避免重复调用。
+        """
+        if not self._ai_enabled or not torrent_name:
+            return None
+        prefix = "【AI辅助识别】"
+        now = int(time.time())
+        try:
+            cache = dict(self.get_data('ai_guess_cache') or {})
+        except Exception:
+            cache = {}
+        cached = cache.get(torrent_name)
+        if cached and now - cached.get('ts', 0) < self.AI_CACHE_TTL:
+            guess = cached.get('guess')
+        else:
+            if self._ai_calls_this_run >= self.AI_MAX_CALLS_PER_RUN:
+                logger.info(f"{prefix}本轮调用已达上限{self.AI_MAX_CALLS_PER_RUN}次，下轮再识别: {torrent_name}")
+                return None
+            self._ai_calls_this_run += 1
+            guess = self._ask_ai_for_media(torrent_name)
+            cache[torrent_name] = {'guess': guess, 'ts': now}
+            cache = {k: v for k, v in cache.items() if now - v.get('ts', 0) < self.AI_CACHE_TTL}
+            try:
+                self.save_data('ai_guess_cache', cache)
+            except Exception as e:
+                logger.debug(f"{prefix}保存缓存失败: {e}")
+
+        if not guess or not guess.get('title'):
+            logger.info(f"{prefix}AI未能判断作品: {torrent_name}")
+            return None
+
+        media_chain = MediaChain()
+        for title in [guess.get('title'), guess.get('original_title')]:
+            if not title:
+                continue
+            meta = MetaInfo(title)
+            if guess.get('year'):
+                meta.year = str(guess['year'])
+            if guess.get('type') == 'tv':
+                meta.type = MediaType.TV
+                if guess.get('season'):
+                    meta.begin_season = guess['season']
+            elif guess.get('type') == 'movie':
+                meta.type = MediaType.MOVIE
+            try:
+                mediainfo = media_chain.recognize_by_meta(meta)
+            except Exception as e:
+                logger.warning(f"{prefix}TMDB核对异常: {e}")
+                mediainfo = None
+            if mediainfo:
+                logger.info(f"{prefix}{torrent_name} -> AI推测「{title} {guess.get('year') or ''}」-> TMDB确认: {mediainfo.title_year}")
+                return mediainfo
+        logger.info(f"{prefix}AI推测「{guess.get('title')} {guess.get('year') or ''}」但TMDB未能确认，不采用: {torrent_name}")
+        return None
+
+    def _ask_ai_for_media(self, torrent_name: str) -> Optional[dict]:
+        """调用 MoviePilot 系统中配置的大模型；插件里填写了模型/地址/密钥时覆盖系统设置"""
+        prefix = "【AI辅助识别】"
+        try:
+            from app.agent.llm.helper import LLMHelper
+        except Exception as e:
+            logger.warning(f"{prefix}当前 MoviePilot 版本不支持 AI 接口: {e}")
+            return None
+
+        overrides = {}
+        if self._ai_model:
+            overrides['model'] = self._ai_model
+        if self._ai_base_url:
+            overrides['base_url'] = self._ai_base_url
+        if self._ai_api_key:
+            overrides['api_key'] = self._ai_api_key
+
+        async def _ask():
+            llm = await LLMHelper.get_llm(streaming=False, thinking_level="off", **overrides)
+            try:
+                reply = await asyncio.wait_for(
+                    llm.ainvoke([("system", self.AI_PROMPT), ("human", torrent_name)]), timeout=self.AI_TIMEOUT)
+                return LLMHelper.extract_text_content(reply.content, fallback_to_string=True)
+            finally:
+                try:
+                    await LLMHelper.close_llm(llm)
+                except Exception:
+                    pass
+
+        try:
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+            if in_loop:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    text = pool.submit(lambda: asyncio.run(_ask())).result(timeout=self.AI_TIMEOUT + 30)
+            else:
+                text = asyncio.run(_ask())
+        except Exception as e:
+            logger.warning(f"{prefix}调用AI失败: {e}")
+            return None
+        return self._parse_ai_json(text)
+
+    @staticmethod
+    def _parse_ai_json(text: str) -> Optional[dict]:
+        if not text:
+            return None
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        year = data.get('year')
+        season = data.get('season')
+        return {
+            'title': str(data.get('title') or '').strip(),
+            'original_title': str(data.get('original_title') or '').strip(),
+            'year': int(year) if isinstance(year, (int, float)) or (isinstance(year, str) and year.isdigit()) else None,
+            'type': data.get('type') if data.get('type') in ('movie', 'tv') else None,
+            'season': int(season) if isinstance(season, (int, float)) or (isinstance(season, str) and season.isdigit()) else None,
+        }
+
     def _clean_unrecognized_torrents(self, downloader_obj, torrents, downloader_name):
         """
         清理识别不到媒体信息的下载任务。
@@ -1513,7 +1667,7 @@ class QbOptimizerPlus(_PluginBase):
             except Exception as e:
                 logger.warning(f"{prefix}识别异常，本次跳过: {torrent_name}, 错误: {e}")
                 continue
-            if mediainfo:
+            if mediainfo or self._ai_recognize(torrent_name):
                 self._recognized_cache.add(torrent.hash)
                 continue
 
@@ -2179,10 +2333,10 @@ class QbOptimizerPlus(_PluginBase):
             mediainfo = media_chain.recognize_by_meta(meta)
             if mediainfo:
                 logger.info(f"{prefix}按种子名识别: {mediainfo.title_year}")
-            return mediainfo
+                return mediainfo
         except Exception as e:
             logger.warning(f"{prefix}按种子名识别失败: {e}")
-            return None
+        return self._ai_recognize(getattr(meta, 'org_string', None) or meta.title)
 
     def _search_candidates(self, meta, mediainfo: Optional[MediaInfo], name: str) -> list:
         prefix = "【重新下载】"
@@ -3350,6 +3504,90 @@ class QbOptimizerPlus(_PluginBase):
                             }
                         ]
                     },
+
+                    # AI 辅助识别（可选）
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'text': 'AI辅助识别（可选）'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'ai_enabled', 'label': '启用AI辅助识别'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'ai_model', 'label': '模型（留空用系统设置）'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'ai_base_url', 'label': 'API地址（留空用系统设置）'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'ai_api_key', 'label': 'API Key（留空用系统设置）', 'type': 'password'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '仅在 MoviePilot 和 TMDB 都识别不出种子时调用：AI 根据种子名推测片名、年份、类型，再交给 TMDB 核对，'
+                                                    '核对成功才采用（避免误删识别不到的种子、帮助重新下载时找到正确资源）。AI 不参与任何删除/暂停决定。'
+                                                    '默认使用 MoviePilot 系统的 AI 设置；每轮最多调用10次，结果按种子名缓存7天。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     
 
 
@@ -3469,6 +3707,11 @@ class QbOptimizerPlus(_PluginBase):
             "redownload_min_seeders": 3,
             "redownload_size_tolerance": 50,
             "redownload_max_attempts": 3,
+            # AI 辅助识别
+            "ai_enabled": False,
+            "ai_model": "",
+            "ai_base_url": "",
+            "ai_api_key": "",
         }
 
     def get_page(self) -> List[dict]:
