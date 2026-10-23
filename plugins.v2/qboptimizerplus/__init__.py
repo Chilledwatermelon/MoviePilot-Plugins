@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -127,6 +127,10 @@ class QbOptimizerPlus(_PluginBase):
     _notify_summary_title = ""
     _notify_summary_body = ""
 
+    # 清理已被 MP 整理移走的种子
+    _enable_moved_clean = True
+    _moved_clean_delay_minutes = 30
+
     # 错误种子处理
     _enable_error_handle = True
     _error_timeout_hours = 24        # 持续报错超过N小时删除并重新下载，0为不删除
@@ -139,7 +143,7 @@ class QbOptimizerPlus(_PluginBase):
         logger.info("【QB种子优化】开始初始化插件...")
         self._removed_hashes = set()
         self._recognized_cache = set()
-        self._events = {'replaced': [], 'kept': [], 'deleted': []}
+        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': []}
         self._last_free_gb = None
         self._current_downloader = None
         logger.info(f"【QB种子优化】收到配置: {config}")
@@ -212,6 +216,9 @@ class QbOptimizerPlus(_PluginBase):
             self._notify_max_items = int(config.get("notify_max_items") or 10)
             self._notify_summary_title = config.get("notify_summary_title") or ""
             self._notify_summary_body = config.get("notify_summary_body") or ""
+
+            self._enable_moved_clean = bool(config.get("enable_moved_clean", True))
+            self._moved_clean_delay_minutes = int(config.get("moved_clean_delay_minutes", 30) or 0)
 
             self._enable_error_handle = bool(config.get("enable_error_handle", True))
             self._error_timeout_hours = int(config.get("error_timeout_hours", 24) or 0)
@@ -573,11 +580,12 @@ class QbOptimizerPlus(_PluginBase):
         total_priority_boosted = 0
         self._current_downloader = None
         self._ai_calls_this_run = 0
-        self._events = {'replaced': [], 'kept': [], 'deleted': []}
+        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': []}
         self._last_free_gb = None
         total_timeout_removed = 0
         total_unrecognized_removed = 0
         total_error_removed = 0
+        total_moved_removed = 0
         all_failed_torrents = []  # 收集所有重新下载失败的种子
         
         for downloader_name in self._downloaders:
@@ -638,6 +646,8 @@ class QbOptimizerPlus(_PluginBase):
                         downloader_obj, self._alive(all_torrents), downloader_name)
                     unrecognized_removed = self._clean_unrecognized_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
+                    moved_removed = self._clean_moved_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
                     error_removed, error_failed = self._handle_error_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
                     priority_boosted = self._boost_priority_torrents(
@@ -658,6 +668,7 @@ class QbOptimizerPlus(_PluginBase):
                     total_timeout_removed += timeout_removed
                     total_unrecognized_removed += unrecognized_removed
                     total_error_removed += error_removed
+                    total_moved_removed += moved_removed
                     
                     # 收集重新下载失败信息
                     all_failed_torrents.extend(zero_seed_failed)
@@ -682,6 +693,7 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"  - 清理慢速下载: {total_timeout_removed}个")
         logger.info(f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个")
         logger.info(f"  - 清理长期报错种子: {total_error_removed}个")
+        logger.info(f"  - 清理已整理移走的种子: {total_moved_removed}个")
         logger.info(f"  - 重新下载失败: {len(all_failed_torrents)}个")
         
         self._send_run_summary()
@@ -694,8 +706,8 @@ class QbOptimizerPlus(_PluginBase):
         'error': '报错种子提醒',
         'oversize': '超出可用空间的种子',
     }
-    DEFAULT_SUMMARY_TITLE = "🧹 {前缀}｜替换 {替换数} · 保留 {保留数} · 删除 {删除数}"
-    DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}"
+    DEFAULT_SUMMARY_TITLE = "🧹 {前缀}｜{摘要}"
+    DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}{整理列表}"
 
     class _SafeDict(dict):
         def __missing__(self, key):
@@ -705,6 +717,10 @@ class QbOptimizerPlus(_PluginBase):
         name = str(name or '')
         limit = max(self._notify_name_length, 10)
         return name if len(name) <= limit else name[:limit - 1] + '…'
+
+    def _name(self, name) -> str:
+        """通知中的种子名：等宽显示，避免 TG Markdown 把 _ * [] 当成格式，点击可复制"""
+        return f"`{self._short(name).replace('`', '')}`"
 
     @staticmethod
     def _brief(info: dict) -> str:
@@ -756,6 +772,10 @@ class QbOptimizerPlus(_PluginBase):
             '替换列表': self._section("♻️ 已替换为新资源", events['replaced']),
             '保留列表': self._section("⚠️ 未找到替代资源，已保留原种子", events['kept']),
             '删除列表': self._section("🗑️ 已删除", events['deleted']),
+            '整理数': len(events['moved']),
+            '摘要': ' · '.join(f"{label} {len(events[key])}" for label, key in
+                               [('替换', 'replaced'), ('保留', 'kept'), ('删除', 'deleted'), ('已整理', 'moved')] if events[key]),
+            '整理列表': self._section("📤 文件已被MP整理移走，清理种子记录", events['moved']),
             '下载器': ', '.join(self._downloaders),
             '剩余空间': f"{self._last_free_gb:.1f}G" if self._last_free_gb is not None else '未知',
             '时间': datetime.now().strftime('%m-%d %H:%M'),
@@ -1261,7 +1281,7 @@ class QbOptimizerPlus(_PluginBase):
             deleted = self._delete_torrent(downloader_obj, torrent, all_torrents, prefix)
             if deleted:
                 self._events['deleted'].append(
-                    f"• {self._short(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n  原因：{reason}（{why}）")
+                    f"• {self._name(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n  原因：{reason}（{why}）")
             return deleted, None
 
         now = int(time.time())
@@ -1285,7 +1305,7 @@ class QbOptimizerPlus(_PluginBase):
             fresh, error = downloader_obj.get_torrents()
             deleted = self._delete_torrent(downloader_obj, torrent, fresh if not error and fresh else all_torrents, prefix)
             self._events['replaced'].append(
-                f"• {self._short(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ↳ {detail}"
+                f"• {self._name(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ↳ {detail}"
                 + ("" if deleted else "\n  （原种子删除失败，请手动处理）"))
             return deleted, None
         fail_reason = detail
@@ -1297,7 +1317,7 @@ class QbOptimizerPlus(_PluginBase):
         if not first_miss:
             return False, None
         self._events['kept'].append(
-            f"• {self._short(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ✗ {fail_reason}（6小时后再搜）")
+            f"• {self._name(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ✗ {fail_reason}（6小时后再搜）")
         return False, {
             'name': torrent_info['name'],
             'hash': torrent_info['hash'],
@@ -1786,8 +1806,62 @@ class QbOptimizerPlus(_PluginBase):
             if self._delete_torrent(downloader_obj, torrent, torrents, prefix):
                 removed += 1
                 self._events['deleted'].append(
-                    f"• {self._short(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n"
+                    f"• {self._name(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n"
                     f"  原因：识别不到媒体信息（持续1小时以上{'，AI也未能确认' if self._ai_enabled else ''}）")
+        return removed
+
+    def _get_transfer_records(self, torrent_hash: str) -> list:
+        try:
+            from app.db.transferhistory_oper import TransferHistoryOper
+            return TransferHistoryOper().list_by_hash(torrent_hash) or []
+        except Exception as e:
+            logger.debug(f"【QB种子优化】查询整理记录失败 {torrent_hash}: {e}")
+            return []
+
+    def _moved_by_mp(self, torrent_hash: str) -> bool:
+        """MoviePilot 已用“移动”方式成功整理过该种子的文件（下载目录里的文件已不在）"""
+        return any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move'
+                   for r in self._get_transfer_records(torrent_hash))
+
+    def _clean_moved_torrents(self, downloader_obj, torrents, downloader_name):
+        """
+        MoviePilot 整理方式为“移动”时，文件移走后 qB 里的已完成种子只剩空壳（无法做种，也会占着列表）。
+        对已下载完成、完成超过N分钟、且 MP 整理记录里有移动成功记录的种子，只删除种子记录、不删除任何文件。
+        """
+        prefix = "【功能8-已整理移走】"
+        if not self._enable_moved_clean:
+            logger.info(f"{prefix}功能已禁用，跳过")
+            return 0
+        now = int(time.time())
+        delay = self._moved_clean_delay_minutes * 60
+        removed = 0
+        for torrent in torrents:
+            if getattr(torrent, 'progress', 0) < 1:
+                continue
+            completed_on = self._first_int_attr(torrent, ['completion_on'])
+            if completed_on > 0 and now - completed_on < delay:
+                continue
+            if self._get_exclude_reason(torrent):
+                continue
+            records = self._get_transfer_records(torrent.hash)
+            moved = [r for r in records if getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move']
+            if not moved:
+                continue
+            failed = [r for r in records if not getattr(r, 'status', False)]
+            try:
+                downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=torrent.hash)
+            except Exception as e:
+                logger.warning(f"{prefix}删除种子记录失败: {torrent.name}, 错误: {e}")
+                continue
+            self._removed_hashes.add(torrent.hash)
+            removed += 1
+            dest = getattr(moved[-1], 'dest', '') or ''
+            logger.info(f"{prefix}已删除种子记录（文件已移至 {dest}）: {torrent.name}")
+            self._events['moved'].append(
+                f"• {self._name(torrent.name)}\n  {StringUtils.str_filesize(getattr(torrent, 'size', 0))} · "
+                f"已整理 {len(moved)} 个文件" + (f" · 失败 {len(failed)} 个" if failed else "")
+                + (f"\n  → {self._name(dest)}" if dest else ""))
+        logger.info(f"{prefix}清理{removed}个文件已被移走的已完成种子")
         return removed
 
     def _handle_error_torrents(self, downloader_obj, torrents, downloader_name):
@@ -1829,6 +1903,15 @@ class QbOptimizerPlus(_PluginBase):
             hours = (now - record['first']) / 3600
             completed = getattr(torrent, 'progress', 0) >= 1
             keep_reason = self._get_exclude_reason(torrent)
+            if self._moved_by_mp(torrent.hash):
+                # 季包下载中途被 MP 移走了已完成的单集：重新校验会把移走的文件重新下载，替换会重下整包
+                keep_reason = keep_reason or "部分文件已被MP整理移走"
+                if not record.get('notified'):
+                    to_notify.append((torrent, hours, completed, keep_reason))
+                    record['notified'] = True
+                records[torrent.hash] = record
+                logger.info(f"{prefix}文件已被MP整理移走过，不重新校验、不删除: {torrent.name}")
+                continue
 
             if (timeout_seconds > 0 and now - record['first'] >= timeout_seconds
                     and not completed and not keep_reason):
@@ -1861,8 +1944,8 @@ class QbOptimizerPlus(_PluginBase):
                     plan = f"约 {left:.0f} 小时后删除并搜索替代资源"
                 else:
                     plan = "未开启超时删除，需手动处理"
-                lines.append(f"• {self._short(torrent.name)}\n  {getattr(torrent, 'state', '')} · 已报错 {hours:.1f} 小时 · "
-                             f"进度 {getattr(torrent, 'progress', 0) * 100:.0f}%\n  路径：{getattr(torrent, 'save_path', '')}\n  处理：{plan}")
+                lines.append(f"• {self._name(torrent.name)}\n  {getattr(torrent, 'state', '')} · 已报错 {hours:.1f} 小时 · "
+                             f"进度 {getattr(torrent, 'progress', 0) * 100:.0f}%\n  路径：{self._name(getattr(torrent, 'save_path', ''))}\n  处理：{plan}")
             self._send('error', f"❗ {self._notify_prefix}｜{len(to_notify)} 个种子重试 3 次仍报错",
                        self._section("报错种子", lines)
                        + "\n常见原因：磁盘写满、保存路径不可写或挂载断开、文件被删除或移动")
@@ -2398,7 +2481,7 @@ class QbOptimizerPlus(_PluginBase):
             self._send('oversize', f"📦 {self._notify_prefix}｜{len(new_oversize)} 个种子超出可用空间",
                        f"💾 剩余 {StringUtils.str_filesize(free_bytes)} − 阈值 {self._min_disk_space_threshold}G = 预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
                        + self._section("当前空间下无法下载完成", [
-                           f"• {self._short(t.name)}\n  还需 {StringUtils.str_filesize(r)} · 进度 {getattr(t, 'progress', 0) * 100:.0f}%"
+                           f"• {self._name(t.name)}\n  还需 {StringUtils.str_filesize(r)} · 进度 {getattr(t, 'progress', 0) * 100:.0f}%"
                            for t, r in new_oversize])
                        + "\n建议清理磁盘空间；要优先下载的种子可打上 keep 标签")
         oversize_notified.update(t.hash for t, _ in new_oversize)
@@ -2432,7 +2515,7 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 if downloader_obj.stop_torrents(ids=[torrent_hash]):
                     paused_by_plugin.add(torrent_hash)
-                    paused_names.append(f"• {self._short(torrent.name)}\n  平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
+                    paused_names.append(f"• {self._name(torrent.name)}\n  平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
                     logger.info(f"{prefix}暂停: {torrent.name}（平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}暂停失败: {torrent.name}")
@@ -2443,7 +2526,7 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 if downloader_obj.start_torrents(ids=[torrent_hash]):
                     paused_by_plugin.discard(torrent_hash)
-                    resumed_names.append(f"• {self._short(torrent.name)}\n  上次平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
+                    resumed_names.append(f"• {self._name(torrent.name)}\n  上次平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
                     logger.info(f"{prefix}恢复: {torrent.name}（上次平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}恢复失败: {torrent.name}")
@@ -2491,7 +2574,7 @@ class QbOptimizerPlus(_PluginBase):
         history[attempt_key] = {'count': attempts + 1, 'ts': int(time.time()), 'title': best.torrent_info.title}
         self._save_redownload_history(history)
         ti = best.torrent_info
-        return True, (f"{self._short(ti.title)}\n     {getattr(ti, 'site_name', '') or '未知站点'} · 做种 {getattr(ti, 'seeders', 0)}"
+        return True, (f"{self._name(ti.title)}\n  {getattr(ti, 'site_name', '') or '未知站点'} · 做种 {getattr(ti, 'seeders', 0)}"
                       f" · {StringUtils.str_filesize(getattr(ti, 'size', 0) or 0)}"
                       f"{'（第' + str(attempts + 1) + '次自动重下）' if attempts else ''}")
 
@@ -3066,7 +3149,7 @@ class QbOptimizerPlus(_PluginBase):
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'density': 'compact',
-                                            'text': '模板可用占位符：{前缀} {替换数} {保留数} {删除数} {替换列表} {保留列表} {删除列表} {下载器} {剩余空间} {时间}。'
+                                            'text': '模板可用占位符：{前缀} {摘要}（只列出有发生的类别） {替换数} {保留数} {删除数} {整理数} {替换列表} {保留列表} {删除列表} {整理列表} {下载器} {剩余空间} {时间}。'
                                                     '列表占位符已包含小标题，没有内容时为空。每条记录包含名称、大小、进度、原因，替换记录还有新资源的站点、做种数和大小。'
                                                     '每轮最多发送一条汇总，状态不变时不会重复提醒。'
                                         }
@@ -3322,6 +3405,69 @@ class QbOptimizerPlus(_PluginBase):
                                             'label': '每次处理数量',
                                             'placeholder': '50',
                                             'type': 'number'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+
+                    # 清理已整理移走的种子
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'text': '清理已被整理移走的种子'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enable_moved_clean', 'label': '启用清理已整理移走的种子'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'moved_clean_delay_minutes',
+                                            'label': '下载完成满N分钟后清理',
+                                            'placeholder': '30',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': 'MP 整理方式为“移动”时，文件移走后 qB 里的已完成种子已无法做种。'
+                                                    '有 MP 移动成功记录的已完成种子会被删除种子记录，不删除任何文件。'
                                         }
                                     }
                                 ]
@@ -4121,6 +4267,9 @@ class QbOptimizerPlus(_PluginBase):
             "notify_max_items": 10,
             "notify_summary_title": "",
             "notify_summary_body": "",
+            # 清理已整理移走的种子
+            "enable_moved_clean": True,
+            "moved_clean_delay_minutes": 30,
             # 错误种子处理
             "enable_error_handle": True,
             "error_timeout_hours": 24,
