@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.7"
+    plugin_version = "1.10.8"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -144,6 +144,7 @@ class QbOptimizerPlus(_PluginBase):
     def init_plugin(self, config: dict = None):
         logger.info("【QB种子优化】开始初始化插件...")
         self._removed_hashes = set()
+        self._rechecked_this_run = False
         self._recognized_cache = set()
         self._qb_settings_logged = set()
         self._qb_log_last_id = {}
@@ -647,6 +648,7 @@ class QbOptimizerPlus(_PluginBase):
                     logger.info(f"【QB种子优化】开始执行优化操作...")
                     # 每一步都基于剔除了前面步骤已删除种子的列表，避免重复处理和空间计算错误
                     self._removed_hashes = set()
+                    self._rechecked_this_run = False
                     if self._enable_moved_clean:
                         self._sync_moved_files(downloader_obj, all_torrents)
                     self._dedupe_torrents(downloader_obj, self._alive(all_torrents))
@@ -2063,6 +2065,7 @@ class QbOptimizerPlus(_PluginBase):
                     downloader_obj.qbc.torrents_file_priority(torrent_hash=torrent.hash, file_ids=to_skip, priority=0)
                 if need_recheck:
                     downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
+                    self._rechecked_this_run = True
                     rechecks_done += 1
                     entry['recheck_ts'] = now_ts
                     entry['moved'] = sorted(moved)
@@ -2398,6 +2401,7 @@ class QbOptimizerPlus(_PluginBase):
             # 文件丢失或读写出错：先重新校验，让 qB 找出缺失/损坏的分块重新下载；磁盘写满等其它原因直接继续
             if (getattr(torrent, 'state', '') or '').lower() == 'missingfiles' or reason in ('missing', 'io'):
                 downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
+                self._rechecked_this_run = True
             return bool(downloader_obj.start_torrents(ids=[torrent.hash]))
         except Exception as e:
             logger.warning(f"【功能7-错误种子】重试失败: {torrent.name}, 错误: {e}")
@@ -2556,6 +2560,16 @@ class QbOptimizerPlus(_PluginBase):
     IO_LIMIT_MIN_KBPS = 5 * 1024
     IO_LIMIT_STEP_UP = 2.0
     IO_LIMIT_RELEASE_KBPS = 200 * 1024
+    # 连续几轮过载才开始降速（短暂的写盘高峰几分钟内会自行消化）
+    IO_LIMIT_CONFIRM_RUNS = 2
+    # 降速后 I/O 指标至少下降这么多才算有效，否则说明压力不是下载写入造成的
+    IO_LIMIT_EFFECTIVE_RATIO = 0.7
+    # 降速无效而解除后，这段时间内不再因 I/O 降速
+    IO_LIMIT_BLOCK_SECONDS = 3600
+
+    @staticmethod
+    def _meta_q_text(meta: dict, data: dict) -> str:
+        return f"{meta.get('q') or 0:.0f} → {data['avg_io_jobs']:.0f}，写入缓存 {meta.get('cache') or 0:.0f}% → {data['avg_cache_overload']:.0f}%"
 
     @staticmethod
     def _fmt_kbps(kbps: float) -> str:
@@ -2564,8 +2578,9 @@ class QbOptimizerPlus(_PluginBase):
     def _monitor_disk_and_io(self, downloader_obj, downloader_name, torrents=None):
         """
         I/O 监控（自适应限速）：持续监测写入缓存和 I/O 队列，
-        过载时把下载限速设为当前实际速度的60%（不低于5MB/s），仍过载继续按比例下调；
-        恢复后每轮提速1.5倍，负载很低或提到200MB/s以上时完全解除。
+        连续2轮过载才把下载限速设为当前实际速度的60%（不低于5MB/s）；
+        降速后压力明显下降但仍过载则继续下调，压力没下降说明不是下载写入造成的，直接解除并1小时内不再降速；
+        有种子在校验（含本轮插件触发的校验）时不降速；恢复后每轮翻倍提速，负载很低或提到200MB/s以上时完全解除。
         只管理本功能设置的限速；磁盘空间不足或手动设置的限速不干预。
         """
         prefix = "【功能4-IO监控】"
@@ -2585,10 +2600,17 @@ class QbOptimizerPlus(_PluginBase):
         except Exception:
             state = {}
         io_limit = state.get(downloader_name)
+        try:
+            meta_all = dict(self.get_data('io_meta') or {})
+        except Exception:
+            meta_all = {}
+        meta = dict(meta_all.get(downloader_name) or {})
 
         def save_state():
+            meta_all[downloader_name] = meta
             try:
                 self.save_data('io_limit', state)
+                self.save_data('io_meta', meta_all)
             except Exception as e:
                 logger.debug(f"{prefix}保存限速记录失败: {e}")
 
@@ -2609,11 +2631,50 @@ class QbOptimizerPlus(_PluginBase):
         load = (f"写入缓存 平均 {data['avg_cache_overload']:.0f}%（阈值 {self._io_cache_threshold}%）\n"
                 f"I/O 队列 平均 {data['avg_io_jobs']:.0f}（阈值 {self._io_queue_threshold}）")
 
-        checking = [t for t in (torrents or []) if 'checking' in (getattr(t, 'state', '') or '').lower()]
-        if should_limit and checking:
-            # 重新校验（重启后或季包校验）产生的是读压力，限制下载速度无济于事，只会白白降速
-            logger.info(f"{prefix}{len(checking)}个种子正在校验，I/O压力主要来自校验，本轮不降速")
-            should_limit = False
+        now = time.time()
+        if should_limit:
+            checking = [t for t in (torrents or []) if 'checking' in (getattr(t, 'state', '') or '').lower()]
+            if not checking:
+                try:
+                    checking = list(qb_client.torrents_info(status_filter='checking') or [])
+                except Exception:
+                    checking = []
+            if checking or getattr(self, '_rechecked_this_run', False):
+                # 重新校验（重启后或季包校验）产生的是读压力，限制下载速度无济于事，只会白白降速
+                what = f"{len(checking)}个种子正在校验" if checking else "本轮刚触发了重新校验"
+                logger.info(f"{prefix}{what}，I/O压力主要来自校验，本轮不降速")
+                should_limit = False
+                meta['strikes'] = 0
+                save_state()
+
+        if should_limit and not io_limit:
+            if now < meta.get('block_until', 0):
+                logger.info(f"{prefix}I/O过载，但上次降速无效（压力不是来自下载写入），"
+                            f"{int((meta['block_until'] - now) / 60)}分钟内不再降速")
+                return False
+            meta['strikes'] = meta.get('strikes', 0) + 1
+            if meta['strikes'] < self.IO_LIMIT_CONFIRM_RUNS:
+                logger.info(f"{prefix}I/O过载（连续第{meta['strikes']}轮），"
+                            f"连续{self.IO_LIMIT_CONFIRM_RUNS}轮过载才降速，短暂的写盘高峰通常几分钟内自行消化")
+                save_state()
+                return False
+
+        if should_limit and io_limit and meta.get('q') is not None:
+            effective = (data['avg_io_jobs'] < meta['q'] * self.IO_LIMIT_EFFECTIVE_RATIO
+                         or data['avg_cache_overload'] < meta.get('cache', 0) * self.IO_LIMIT_EFFECTIVE_RATIO)
+            if not effective:
+                meta_prev = dict(meta)
+                if not self._set_download_speed_limit(downloader_obj, 0):
+                    return False
+                state.pop(downloader_name, None)
+                meta.update({'strikes': 0, 'q': None, 'cache': None, 'block_until': now + self.IO_LIMIT_BLOCK_SECONDS})
+                save_state()
+                logger.info(f"{prefix}降速到 {self._fmt_kbps(io_limit)} 后I/O压力没有明显下降"
+                            f"（队列 {self._meta_q_text(meta_prev, data)}），压力不是来自下载写入（多为校验、整理搬运或做种读取），"
+                            f"解除限速，{self.IO_LIMIT_BLOCK_SECONDS // 60}分钟内不再因I/O降速")
+                self._send('limit', f"✅ {self._notify_prefix}｜降速无效，已解除限速",
+                           f"{load}\nI/O 压力不是下载写入造成的，限速 {self._fmt_kbps(io_limit)} → 不限速")
+                return True
 
         if should_limit:
             base = min(io_limit, max(avg_speed_kbps, self.IO_LIMIT_MIN_KBPS)) if io_limit else max(avg_speed_kbps, self.IO_LIMIT_MIN_KBPS)
@@ -2624,6 +2685,7 @@ class QbOptimizerPlus(_PluginBase):
             if not self._set_download_speed_limit(downloader_obj, target * 1024):
                 return False
             state[downloader_name] = target
+            meta.update({'strikes': 0, 'q': data['avg_io_jobs'], 'cache': data['avg_cache_overload']})
             save_state()
             logger.warning(f"{prefix}I/O过载，下载限速 {self._fmt_kbps(io_limit) if io_limit else '不限速'} → {self._fmt_kbps(target)}"
                            f"（当前实际速度约 {self._fmt_kbps(avg_speed_kbps)}）")
@@ -2633,6 +2695,9 @@ class QbOptimizerPlus(_PluginBase):
                            f"I/O 恢复后每轮逐步提速，直到解除")
             return True
 
+        if meta.get('strikes'):
+            meta['strikes'] = 0
+            save_state()
         if not io_limit:
             logger.info(f"{prefix}I/O正常，无需限速")
             return False
@@ -2644,6 +2709,7 @@ class QbOptimizerPlus(_PluginBase):
             if not self._set_download_speed_limit(downloader_obj, 0):
                 return False
             state.pop(downloader_name, None)
+            meta.update({'q': None, 'cache': None})
             save_state()
             logger.info(f"{prefix}I/O已恢复，解除限速（原 {self._fmt_kbps(io_limit)}）")
             self._send('limit', f"✅ {self._notify_prefix}｜磁盘 I/O 已恢复，已解除限速",
