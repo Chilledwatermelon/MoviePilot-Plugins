@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.7"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1891,6 +1891,21 @@ class QbOptimizerPlus(_PluginBase):
             if not moved:
                 continue
             priorities = {self._file_index(f, i): getattr(f, 'priority', 1) for i, f in enumerate(files)}
+            wanted_left = [i for i, p in priorities.items() if p != 0 and i not in moved]
+            if not wanted_left and not self._get_exclude_reason(torrent):
+                # 需要的文件已全部被 MP 整理移走：种子已无内容可下，只删除种子记录（不删除任何文件）
+                try:
+                    downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=torrent.hash)
+                except Exception as e:
+                    logger.warning(f"{prefix}删除种子记录失败: {torrent.name}, 错误: {e}")
+                    continue
+                self._removed_hashes.add(torrent.hash)
+                handled.pop(torrent.hash, None)
+                logger.info(f"{prefix}需要的文件已全部被MP整理移走，删除种子记录: {torrent.name}")
+                self._events['moved'].append(
+                    f"• {self._name(torrent.name)}\n  {StringUtils.str_filesize(getattr(torrent, 'size', 0))} · "
+                    f"{len(moved)} 个文件已全部整理，删除种子记录")
+                continue
             to_skip = sorted(i for i in moved if priorities.get(i, 0) != 0)
             state = (getattr(torrent, 'state', '') or '').lower()
             errored = state in ('error', 'missingfiles')
