@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2822,7 +2822,7 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 if downloader_obj.stop_torrents(ids=[torrent_hash]):
                     paused_by_plugin.add(torrent_hash)
-                    paused_names.append(f"• {self._name(torrent.name)}\n  平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
+                    paused_names.append(f"• {self._name(torrent.name)}\n  平均 {speed:.2f}MB/s，比其它种子慢，先让出空间 · 还需 {StringUtils.str_filesize(remaining)}")
                     logger.info(f"{prefix}暂停: {torrent.name}（平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}暂停失败: {torrent.name}")
@@ -2830,12 +2830,15 @@ class QbOptimizerPlus(_PluginBase):
                 logger.error(f"{prefix}暂停异常: {torrent.name}, 错误: {e}")
         for torrent_hash in to_resume:
             torrent, remaining, speed = info[torrent_hash][:3]
-            if torrent_hash in speed_ema:
+            waited_credit = (wait_credit.get(torrent_hash) or {}).get('credit', 0)
+            if self._never_started(torrent):
+                speed_text = "新种子，首次开始下载"
+            elif torrent_hash in speed_ema:
                 speed_text = f"上次平均 {speed:.2f}MB/s"
-            elif self._never_started(torrent):
-                speed_text = "新添加，首次开始下载"
+                if waited_credit >= max(speed, 0.5):
+                    speed_text += f"，已等待约 {waited_credit / self.WAIT_CREDIT_PER_HOUR:.1f} 小时，轮到它"
             else:
-                speed_text = "速度未知，试速"
+                speed_text = f"之前没测到速度，先下载测速（按 {self.UNKNOWN_SPEED_PRIOR:g}MB/s 估算）"
 
             try:
                 if downloader_obj.start_torrents(ids=[torrent_hash]):
