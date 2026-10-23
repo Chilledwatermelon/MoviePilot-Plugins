@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.1"
+    plugin_version = "1.10.2"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1974,6 +1974,7 @@ class QbOptimizerPlus(_PluginBase):
         return set(getattr(meta, 'episode_list', None) or [])
 
     MOVED_RECHECK_INTERVAL = 3600
+    MAX_RECHECK_PER_RUN = 2
 
     def _sync_moved_files(self, downloader_obj, torrents):
         """
@@ -1987,8 +1988,11 @@ class QbOptimizerPlus(_PluginBase):
             handled = {}
         current = {t.hash for t in torrents}
         handled = {h: v for h, v in handled.items() if h in current}
+        rechecks_done = 0
+        # 报错的种子优先处理；每轮整包重新校验的数量有上限，避免同时校验多个大季包造成 I/O 过载
+        ordered = sorted(torrents, key=lambda t: (getattr(t, 'state', '') or '').lower() not in ('error', 'missingfiles'))
 
-        for torrent in torrents:
+        for torrent in ordered:
             if getattr(torrent, 'progress', 0) >= 1:
                 continue
             try:
@@ -2029,6 +2033,9 @@ class QbOptimizerPlus(_PluginBase):
             now_ts = time.time()
             # 整包重新校验要读完整个种子的数据，开销大：报错时立即做，否则同一种子至少间隔1小时
             need_recheck = errored or (moved - already and now_ts - entry.get('recheck_ts', 0) >= self.MOVED_RECHECK_INTERVAL)
+            if need_recheck and rechecks_done >= self.MAX_RECHECK_PER_RUN:
+                need_recheck = False
+                logger.info(f"{prefix}本轮重新校验已达{self.MAX_RECHECK_PER_RUN}个上限，下轮再校验: {torrent.name}")
             if not to_skip and not need_recheck:
                 continue
             try:
@@ -2036,9 +2043,12 @@ class QbOptimizerPlus(_PluginBase):
                     downloader_obj.qbc.torrents_file_priority(torrent_hash=torrent.hash, file_ids=to_skip, priority=0)
                 if need_recheck:
                     downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
+                    rechecks_done += 1
                     entry['recheck_ts'] = now_ts
                     entry['moved'] = sorted(moved)
-                    downloader_obj.start_torrents(ids=[torrent.hash])
+                    # 只恢复原本因报错停下的种子；被阈值控制暂停的保持暂停，由调度决定何时下载
+                    if errored:
+                        downloader_obj.start_torrents(ids=[torrent.hash])
             except Exception as e:
                 logger.warning(f"{prefix}跳过已移走文件失败: {torrent.name}, 错误: {e}")
                 continue
