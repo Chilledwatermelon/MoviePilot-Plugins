@@ -27,21 +27,21 @@ from app.utils.string import StringUtils
 lock = threading.Lock()
 
 
-class QbOptimizer(_PluginBase):
+class QbOptimizerPlus(_PluginBase):
     # 插件名称
-    plugin_name = "QB种子优化"
+    plugin_name = "QB种子优化Plus"
     # 插件描述
-    plugin_desc = "优化qBittorrent种子管理：清理进行中无人做种任务、清理预计下载时长超过N小时且已下载N小时的慢速任务、智能综合评分优先级（下载速度+做种数+进度）、下载阈值控制（当下载中种子总大小超过阈值时优先暂停低速低进度种子，确保磁盘空间不超阈值）"
+    plugin_desc = "基于 leG09 的QB种子优化改进：做种数复核防误删、排除过滤、精确重新下载。清理进行中无人做种任务、清理预计下载时长超过N小时且已下载N小时的慢速任务、智能综合评分优先级（下载速度+做种数+进度）、下载阈值控制（当下载中种子总大小超过阈值时优先暂停低速低进度种子，确保磁盘空间不超阈值）"
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10"
+    plugin_version = "1.0"
     # 插件作者
-    plugin_author = "leG09"
+    plugin_author = "Chilledwatermelon"
     # 作者主页
-    author_url = "https://github.com/leG09"
+    author_url = "https://github.com/Chilledwatermelon"
     # 插件配置项ID前缀
-    plugin_config_prefix = "qboptimizer_"
+    plugin_config_prefix = "qboptimizerplus_"
     # 加载顺序
     plugin_order = 10
     # 可使用的用户级别
@@ -264,18 +264,18 @@ class QbOptimizer(_PluginBase):
         """
         return [
             {
-                "cmd": "/qb_optimize",
+                "cmd": "/qbp_optimize",
                 "event": EventType.PluginAction,
-                "desc": "执行QB种子优化",
-                "category": "QB优化",
-                "data": {"action": "qb_optimize"},
+                "desc": "执行QB种子优化Plus",
+                "category": "QB优化Plus",
+                "data": {"action": "qbp_optimize"},
             },
             {
-                "cmd": "/qb_status",
+                "cmd": "/qbp_status",
                 "event": EventType.PluginAction,
-                "desc": "查看QB优化状态",
-                "category": "QB优化",
-                "data": {"action": "qb_status"},
+                "desc": "查看QB优化Plus状态",
+                "category": "QB优化Plus",
+                "data": {"action": "qbp_status"},
             },
         ]
 
@@ -288,8 +288,8 @@ class QbOptimizer(_PluginBase):
         """
         if self.get_state():
             return [{
-                "id": "QbOptimizer",
-                "name": "QB种子优化服务",
+                "id": "QbOptimizerPlus",
+                "name": "QB种子优化Plus服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.optimize_torrents,
                 "kwargs": {}
@@ -362,7 +362,7 @@ class QbOptimizer(_PluginBase):
             return
         if event:
             event_data = event.event_data
-            if not event_data or event_data.get("action") != "qb_optimize":
+            if not event_data or event_data.get("action") != "qbp_optimize":
                 return
         self.optimize_torrents()
 
@@ -372,7 +372,7 @@ class QbOptimizer(_PluginBase):
             return
         if event:
             event_data = event.event_data
-            if not event_data or event_data.get("action") != "qb_status":
+            if not event_data or event_data.get("action") != "qbp_status":
                 return
         self.show_status()
 
