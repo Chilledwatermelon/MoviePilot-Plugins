@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.8"
+    plugin_version = "1.8.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -143,6 +143,7 @@ class QbOptimizerPlus(_PluginBase):
         logger.info("【QB种子优化】开始初始化插件...")
         self._removed_hashes = set()
         self._recognized_cache = set()
+        self._qb_settings_logged = set()
         self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': [], 'synced': []}
         self._last_free_gb = None
         self._current_downloader = None
@@ -600,6 +601,7 @@ class QbOptimizerPlus(_PluginBase):
                         continue
 
                     self._current_downloader = downloader_name
+                    self._log_qb_add_settings(downloader_obj, downloader_name)
                     logger.info(f"【QB种子优化】开始获取种子列表: {downloader_name}")
                     # 获取所有种子
                     all_torrents, error = downloader_obj.get_torrents()
@@ -2751,14 +2753,84 @@ class QbOptimizerPlus(_PluginBase):
             except Exception as e:
                 logger.error(f"{prefix}恢复异常: {torrent.name}, 错误: {e}")
 
-        if paused_names or resumed_names:
+        # 试速放在调度动作之后，且失败不影响已完成的暂停/恢复
+        try:
+            probed_names = self._probe_new_torrents(
+                downloader_obj, [info[h][0] for h in info if not info[h][3] and h not in chosen and self._never_started(info[h][0])],
+                speed_ema, paused_by_plugin, prefix)
+        except Exception as e:
+            logger.warning(f"{prefix}新种子试速失败: {e}")
+            probed_names = []
+
+        if paused_names or resumed_names or probed_names:
             self._send('threshold', f"⚖️ {self._notify_prefix}｜下载调度：暂停 {len(paused_names)} · 恢复 {len(resumed_names)}",
                        f"💾 剩余 {StringUtils.str_filesize(free_bytes)}｜预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
                        f"⬇️ 保持下载 {len(chosen)} 个 · 需 {StringUtils.str_filesize(chosen_size)} · 约 {chosen_speed:.1f}MB/s"
                        + (f"（含 keep {len(keep_hashes)} 个）" if keep_hashes else "") + "\n"
                        + self._section("⏸ 暂停", paused_names)
-                       + self._section("▶️ 恢复", resumed_names))
+                       + self._section("▶️ 恢复", resumed_names)
+                       + self._section("🔍 新种子试速（空间不够暂未下载）", probed_names))
         return bool(paused_names or resumed_names)
+
+    PROBE_NEW_PER_RUN = 10
+
+    def _probe_new_torrents(self, downloader_obj, torrents, speed_ema: dict, paused_by_plugin: set, prefix: str) -> list:
+        """
+        空间预算暂时放不下的新种子（添加即停止、从未开始）：临时强制开始并向 tracker 汇报，
+        在设定时间内拿到做种数和初始速度后停回去，结果用于后续调度排序；之后按插件暂停的种子正常轮换。
+        """
+        targets = [t for t in torrents if t.hash not in speed_ema][:self.PROBE_NEW_PER_RUN]
+        if not targets:
+            return []
+        hashes = [t.hash for t in targets]
+        logger.info(f"{prefix}{len(targets)}个新种子空间不够暂不下载，先试速获取做种数和速度")
+        forced = self._set_force_start(downloader_obj, hashes, True)
+        try:
+            downloader_obj.start_torrents(ids=hashes)
+            self._reannounce(downloader_obj, hashes)
+            seeders = self._poll_tracker_seeders(downloader_obj, hashes)
+            refreshed, error = downloader_obj.get_torrents(ids=hashes)
+            speeds = {t.hash: (getattr(t, 'dlspeed', 0) or 0) / 1024 ** 2 for t in (refreshed or [])} if not error else {}
+        finally:
+            if forced:
+                self._set_force_start(downloader_obj, hashes, False)
+            try:
+                downloader_obj.stop_torrents(ids=hashes)
+            except Exception as e:
+                logger.warning(f"{prefix}试速后停止失败: {e}")
+        lines = []
+        for torrent in targets:
+            n = seeders.get(torrent.hash)
+            speed = speeds.get(torrent.hash, 0.0)
+            if n == 0:
+                speed_ema[torrent.hash] = 0.0
+            elif speed > 0:
+                speed_ema[torrent.hash] = round(speed, 3)
+            paused_by_plugin.add(torrent.hash)
+            seed_text = "未知" if n is None else str(n)
+            logger.info(f"{prefix}试速: {torrent.name} 做种{seed_text}，初始速度{speed:.2f}MB/s")
+            lines.append(f"• {self._name(torrent.name)}\n  做种 {seed_text} · 初始 {speed:.2f}MB/s"
+                         + (" · ⚠️ 无人做种" if n == 0 else ""))
+        return lines
+
+    def _log_qb_add_settings(self, downloader_obj, downloader_name):
+        """记录会导致新种子添加后处于停止状态的 qB 设置，便于排查"""
+        if downloader_name in self._qb_settings_logged:
+            return
+        self._qb_settings_logged.add(downloader_name)
+        try:
+            prefs = downloader_obj.qbc.app_preferences() or {}
+        except Exception as e:
+            logger.debug(f"【QB种子优化】读取qB设置失败: {e}")
+            return
+        add_stopped = prefs.get('add_stopped_enabled', prefs.get('start_paused_enabled'))
+        stop_condition = prefs.get('torrent_stop_condition')
+        logger.info(f"【QB种子优化】{downloader_name} qB设置: 添加后不自动开始={add_stopped}，种子停止条件={stop_condition}，"
+                    f"队列={prefs.get('queueing_enabled')}（最大活动下载{prefs.get('max_active_downloads')}），"
+                    f"预分配={prefs.get('preallocate_all')}")
+        if add_stopped or (stop_condition and str(stop_condition) not in ('None', '0')):
+            logger.warning(f"【QB种子优化】{downloader_name} 的 qB 设置会让新种子添加后处于停止状态"
+                           f"（添加后不自动开始={add_stopped}，停止条件={stop_condition}），插件会按空间预算自动开始或试速")
 
     def _re_download_torrent(self, torrent_info) -> Tuple[bool, str]:
         """
