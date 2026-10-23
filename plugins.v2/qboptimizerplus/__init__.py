@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.9"
+    plugin_version = "1.9.1"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2867,6 +2867,7 @@ class QbOptimizerPlus(_PluginBase):
         return bool(paused_names or resumed_names)
 
     PROBE_NEW_PER_RUN = 10
+    PROBE_MIN_SECONDS = 20
 
     def _probe_new_torrents(self, downloader_obj, torrents, speed_ema: dict, paused_by_plugin: set, prefix: str) -> list:
         """
@@ -2880,9 +2881,14 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"{prefix}{len(targets)}个新种子空间不够暂不下载，先试速获取做种数和速度")
         forced = self._set_force_start(downloader_obj, hashes, True)
         try:
+            started_at = time.time()
             downloader_obj.start_torrents(ids=hashes)
             self._reannounce(downloader_obj, hashes)
             seeders = self._poll_tracker_seeders(downloader_obj, hashes)
+            # tracker 往往几秒就返回，此时还没连上用户、速度为0；至少下载一段时间再读速度
+            ramp_left = self.PROBE_MIN_SECONDS - (time.time() - started_at)
+            if ramp_left > 0 and any((n or 0) > 0 for n in seeders.values()):
+                time.sleep(ramp_left)
             refreshed, error = downloader_obj.get_torrents(ids=hashes)
             speeds = {t.hash: (getattr(t, 'dlspeed', 0) or 0) / 1024 ** 2 for t in (refreshed or [])} if not error else {}
         finally:
