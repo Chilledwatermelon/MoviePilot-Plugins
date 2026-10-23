@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -119,6 +119,14 @@ class QbOptimizerPlus(_PluginBase):
     _ai_api_key = ""
     _ai_calls_this_run = 0
 
+    # 通知设置
+    _notify_types = ['summary', 'threshold', 'limit', 'error', 'oversize']
+    _notify_prefix = "QB优化Plus"
+    _notify_name_length = 40
+    _notify_max_items = 10
+    _notify_summary_title = ""
+    _notify_summary_body = ""
+
     # 错误种子处理
     _enable_error_handle = True
     _error_timeout_hours = 24        # 持续报错超过N小时删除并重新下载，0为不删除
@@ -131,6 +139,8 @@ class QbOptimizerPlus(_PluginBase):
         logger.info("【QB种子优化】开始初始化插件...")
         self._removed_hashes = set()
         self._recognized_cache = set()
+        self._events = {'replaced': [], 'kept': [], 'deleted': []}
+        self._last_free_gb = None
         self._current_downloader = None
         logger.info(f"【QB种子优化】收到配置: {config}")
         
@@ -194,6 +204,14 @@ class QbOptimizerPlus(_PluginBase):
             self._redownload_min_seeders = int(config.get("redownload_min_seeders") or 3)
             self._redownload_size_tolerance = int(config.get("redownload_size_tolerance", 50) or 0)
             self._redownload_max_attempts = int(config.get("redownload_max_attempts") or 3)
+
+            notify_types = config.get("notify_types")
+            self._notify_types = list(notify_types) if isinstance(notify_types, list) else list(self.NOTIFY_KINDS)
+            self._notify_prefix = (config.get("notify_prefix") or "QB优化Plus").strip()
+            self._notify_name_length = int(config.get("notify_name_length") or 40)
+            self._notify_max_items = int(config.get("notify_max_items") or 10)
+            self._notify_summary_title = config.get("notify_summary_title") or ""
+            self._notify_summary_body = config.get("notify_summary_body") or ""
 
             self._enable_error_handle = bool(config.get("enable_error_handle", True))
             self._error_timeout_hours = int(config.get("error_timeout_hours", 24) or 0)
@@ -476,19 +494,10 @@ class QbOptimizerPlus(_PluginBase):
                             if success:
                                 logger.info(f"【QB种子优化】下载速度限制成功，停止执行优化任务")
                                 
-                                # 发送通知
-                                if self._notify:
-                                    notification_title = "【QB种子优化】磁盘空间不足，已限制下载速度"
-                                    notification_text = f"磁盘剩余空间: {free_space_gb:.2f}GB\n"
-                                    notification_text += f"空间阈值: {self._disk_space_threshold}GB\n"
-                                    notification_text += f"\n已自动限制下载速度为: {self._speed_limit_mbps}MB/s\n"
-                                    notification_text += f"已停止执行优化任务，避免进一步占用磁盘空间"
-                                    
-                                    self.post_message(
-                                        mtype=NotificationType.Manual,
-                                        title=notification_title,
-                                        text=notification_text
-                                    )
+                                self._send('limit', "💾 磁盘空间不足，已限速",
+                                           f"剩余 {free_space_gb:.1f}G ＜ 阈值 {self._disk_space_threshold}G\n"
+                                           f"下载已限速 {self._speed_limit_mbps}MB/s，本轮暂停所有清理与调度\n"
+                                           f"空间恢复后会自动解除限速")
                                 return True  # 已限速，停止执行任务
                             else:
                                 logger.error(f"【QB种子优化】下载速度限制失败，跳过所有优化任务")
@@ -497,19 +506,6 @@ class QbOptimizerPlus(_PluginBase):
                             # 已限速，跳过所有优化任务
                             logger.warning(f"【QB种子优化】磁盘空间不足且已限速，跳过所有优化任务")
                             
-                            # 发送通知
-                            if self._notify:
-                                notification_title = "【QB种子优化】磁盘空间不足，已跳过所有优化任务"
-                                notification_text = f"磁盘剩余空间: {free_space_gb:.2f}GB\n"
-                                notification_text += f"空间阈值: {self._disk_space_threshold}GB\n"
-                                notification_text += f"当前已处于限速状态: {current_download_limit}KB/s\n"
-                                notification_text += f"\n为避免进一步占用磁盘空间，已跳过所有优化任务"
-                                
-                                self.post_message(
-                                    mtype=NotificationType.Manual,
-                                    title=notification_title,
-                                    text=notification_text
-                                )
                             return True  # 已限速，跳过所有任务
                             
                     except Exception as e:
@@ -535,19 +531,9 @@ class QbOptimizerPlus(_PluginBase):
                             if success:
                                 logger.info(f"【QB种子优化】下载速度限制解除成功，继续执行优化任务")
                                 
-                                # 发送通知
-                                if self._notify:
-                                    notification_title = "【QB种子优化】磁盘空间已恢复，已解除下载速度限制"
-                                    notification_text = f"磁盘剩余空间: {free_space_gb:.2f}GB\n"
-                                    notification_text += f"空间阈值: {self._disk_space_threshold}GB\n"
-                                    notification_text += f"之前限速值: {current_download_limit}KB/s\n"
-                                    notification_text += f"\n已自动解除下载速度限制，恢复正常下载速度"
-                                    
-                                    self.post_message(
-                                        mtype=NotificationType.Manual,
-                                        title=notification_title,
-                                        text=notification_text
-                                    )
+                                self._send('limit', "✅ 磁盘空间已恢复，已解除限速",
+                                           f"剩余 {free_space_gb:.1f}G ≥ 阈值 {self._disk_space_threshold}G\n"
+                                           f"下载限速 {current_download_limit}KB/s → 不限速")
                             else:
                                 logger.warning(f"【QB种子优化】下载速度限制解除失败，但继续执行优化任务")
                         else:
@@ -587,6 +573,8 @@ class QbOptimizerPlus(_PluginBase):
         total_priority_boosted = 0
         self._current_downloader = None
         self._ai_calls_this_run = 0
+        self._events = {'replaced': [], 'kept': [], 'deleted': []}
+        self._last_free_gb = None
         total_timeout_removed = 0
         total_unrecognized_removed = 0
         total_error_removed = 0
@@ -655,6 +643,8 @@ class QbOptimizerPlus(_PluginBase):
                     priority_boosted = self._boost_priority_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
 
+                    self._last_free_gb = self._get_free_space_gb(downloader_obj)
+
                     # 执行磁盘空间和I/O监控
                     disk_monitor_result = self._monitor_disk_and_io(downloader_obj, downloader_name)
 
@@ -694,50 +684,85 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"  - 清理长期报错种子: {total_error_removed}个")
         logger.info(f"  - 重新下载失败: {len(all_failed_torrents)}个")
         
-        # 输出详细总结信息
-        if total_zero_seed_removed > 0 or total_timeout_removed > 0 or total_unrecognized_removed > 0 or total_error_removed > 0 or all_failed_torrents:
-            logger.info(f"【QB种子优化】本次清理总结:")
-            logger.info(f"  清理种子总数: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个")
-            logger.info(f"  - 清理下载中无人做种: {total_zero_seed_removed}个")
-            logger.info(f"  - 清理慢速下载: {total_timeout_removed}个")
-            logger.info(f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个")
-            
-            if all_failed_torrents:
-                logger.warning(f"【QB种子优化】重新下载失败总结: 共{len(all_failed_torrents)}个种子未找到资源")
-                for i, failed_torrent in enumerate(all_failed_torrents, 1):
-                    logger.warning(f"  {i}. {failed_torrent['name']}")
-                    logger.warning(f"     - HASH: {failed_torrent['hash']}")
-                    logger.warning(f"     - 大小: {failed_torrent['size']}")
-                    logger.warning(f"     - 原因: {failed_torrent['reason']}")
-                
-                # 发送通知
-                if self._notify:
-                    summary_message = f"【QB种子优化完成】\n"
-                    summary_message += f"本次清理种子: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个\n"
-                    summary_message += f"  - 清理下载中无人做种: {total_zero_seed_removed}个\n"
-                    summary_message += f"  - 清理慢速下载: {total_timeout_removed}个\n"
-                    summary_message += f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个\n"
-                    summary_message += f"  - 清理长期报错种子: {total_error_removed}个\n"
-                    summary_message += f"重新下载失败: {len(all_failed_torrents)}个\n\n"
-                    summary_message += "失败种子列表:\n"
-                    for i, failed_torrent in enumerate(all_failed_torrents, 1):
-                        summary_message += f"{i}. {failed_torrent['name']}\n"
-                        summary_message += f"   HASH: {failed_torrent['hash']}\n"
-                        summary_message += f"   大小: {failed_torrent['size']}\n"
-                        summary_message += f"   原因: {failed_torrent['reason']}\n\n"
-                    
-                    logger.info(f"【QB种子优化】发送总结通知: 清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个，失败{len(all_failed_torrents)}个")
-                    self.post_message(
-                        mtype=NotificationType.Manual,
-                        title=f"【QB种子优化】清理完成 - {len(all_failed_torrents)}个种子未找到资源",
-                        text=summary_message
-                    )
-            else:
-                logger.info(f"【QB种子优化】重新下载成功总结: 清理的{total_zero_seed_removed + total_timeout_removed}个种子全部重新下载成功")
-                if self._notify:
-                    logger.info(f"【QB种子优化】清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个种子，全部重新下载成功，无需发送通知")
-        else:
-            logger.info(f"【QB种子优化】本次无清理操作，无需发送通知")
+        self._send_run_summary()
+
+    # ---------------- 通知 ----------------
+    NOTIFY_KINDS = {
+        'summary': '清理汇总（替换/保留/删除）',
+        'threshold': '阈值控制暂停/恢复',
+        'limit': '磁盘/IO限速与恢复',
+        'error': '报错种子提醒',
+        'oversize': '超出可用空间的种子',
+    }
+    DEFAULT_SUMMARY_TITLE = "🧹 {前缀}｜替换 {替换数} · 保留 {保留数} · 删除 {删除数}"
+    DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}"
+
+    class _SafeDict(dict):
+        def __missing__(self, key):
+            return '{' + key + '}'
+
+    def _short(self, name) -> str:
+        name = str(name or '')
+        limit = max(self._notify_name_length, 10)
+        return name if len(name) <= limit else name[:limit - 1] + '…'
+
+    @staticmethod
+    def _brief(info: dict) -> str:
+        """种子关键信息：大小 · 进度 · 分类/标签"""
+        parts = [StringUtils.str_filesize(info.get('size') or 0)]
+        if info.get('progress') is not None:
+            parts.append(f"进度 {info['progress'] * 100:.0f}%")
+        if info.get('category'):
+            parts.append(f"分类 {info['category']}")
+        return ' · '.join(parts)
+
+    def _section(self, header: str, lines: list) -> str:
+        if not lines:
+            return ''
+        shown = lines[:max(self._notify_max_items, 1)]
+        text = f"\n{header}（{len(lines)}）\n" + "\n".join(shown)
+        if len(lines) > len(shown):
+            text += f"\n…另有 {len(lines) - len(shown)} 个，详见插件日志"
+        return text + "\n"
+
+    def _render(self, template: str, default: str, values: dict) -> str:
+        for tpl in (template, default):
+            if not tpl:
+                continue
+            try:
+                return tpl.format_map(self._SafeDict(values)).strip()
+            except Exception as e:
+                logger.warning(f"【通知】模板格式有误，改用默认模板: {e}")
+        return ''
+
+    def _send(self, kind: str, title: str, text: str):
+        if not self._notify or kind not in self._notify_types:
+            return
+        try:
+            self.post_message(mtype=NotificationType.Manual, title=title, text=(text or '').strip())
+        except Exception as e:
+            logger.warning(f"【通知】发送失败: {e}")
+
+    def _send_run_summary(self):
+        events = self._events
+        if not any(events.values()):
+            logger.info("【QB种子优化】本次没有替换/保留/删除，无需发送汇总通知")
+            return
+        values = {
+            '前缀': self._notify_prefix,
+            '替换数': len(events['replaced']),
+            '保留数': len(events['kept']),
+            '删除数': len(events['deleted']),
+            '替换列表': self._section("♻️ 已替换为新资源", events['replaced']),
+            '保留列表': self._section("⚠️ 未找到替代资源，已保留原种子", events['kept']),
+            '删除列表': self._section("🗑️ 已删除", events['deleted']),
+            '下载器': ', '.join(self._downloaders),
+            '剩余空间': f"{self._last_free_gb:.1f}G" if self._last_free_gb is not None else '未知',
+            '时间': datetime.now().strftime('%m-%d %H:%M'),
+        }
+        title = self._render(self._notify_summary_title, self.DEFAULT_SUMMARY_TITLE, values)
+        body = self._render(self._notify_summary_body, self.DEFAULT_SUMMARY_BODY, values)
+        self._send('summary', title, body)
 
     def _clean_zero_seed_torrents(self, downloader_obj, torrents, downloader_name):
         """
@@ -764,12 +789,14 @@ class QbOptimizerPlus(_PluginBase):
         candidates = self._filter_excluded(candidates, prefix)
 
         zero_seed_torrents = []
+        dead_detail = {}
         reannounce_hashes = []
         for torrent in candidates:
             verdict, detail = self._verify_no_seeders(downloader_obj, torrent)
             if verdict == 'dead':
                 logger.info(f"{prefix}确认无人做种（{detail}）: {torrent.name}")
                 zero_seed_torrents.append(torrent)
+                dead_detail[torrent.hash] = detail
             else:
                 logger.info(f"{prefix}暂不清理（{detail}）: {torrent.name}")
                 if verdict == 'unknown':
@@ -789,7 +816,8 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"{prefix}删除审计 ({i}/{len(zero_seed_torrents)}): {torrent.name} | HASH={torrent.hash} | "
                         f"进度={getattr(torrent, 'progress', 0) * 100:.1f}% | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | "
                         f"分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
-            ok, failed = self._replace_torrent(downloader_obj, torrent, torrents, '无人做种', prefix)
+            ok, failed = self._replace_torrent(
+                downloader_obj, torrent, torrents, f"无人做种（{dead_detail.get(torrent.hash, '')}）", prefix)
             removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
@@ -1182,6 +1210,7 @@ class QbOptimizerPlus(_PluginBase):
         return {
             'name': torrent.name,
             'size': getattr(torrent, 'size', 0),
+            'progress': getattr(torrent, 'progress', None),
             'hash': torrent.hash,
             'tracker': getattr(torrent, 'tracker', ''),
             'category': getattr(torrent, 'category', ''),
@@ -1229,7 +1258,11 @@ class QbOptimizerPlus(_PluginBase):
         if not self._enable_auto_redownload or not self._search_sites:
             why = "自动重新下载已禁用" if not self._enable_auto_redownload else "未配置搜索站点"
             logger.info(f"{prefix}{why}，直接删除: {torrent.name}")
-            return self._delete_torrent(downloader_obj, torrent, all_torrents, prefix), None
+            deleted = self._delete_torrent(downloader_obj, torrent, all_torrents, prefix)
+            if deleted:
+                self._events['deleted'].append(
+                    f"• {self._short(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n  原因：{reason}（{why}）")
+            return deleted, None
 
         now = int(time.time())
         current = {t.hash for t in all_torrents}
@@ -1244,13 +1277,18 @@ class QbOptimizerPlus(_PluginBase):
             return False, None
 
         torrent_info = self._snapshot_torrent(torrent)
-        ok, fail_reason = self._re_download_torrent(torrent_info)
+        ok, detail = self._re_download_torrent(torrent_info)
         if ok:
             misses.pop(torrent.hash, None)
             self._save_replacement_misses(misses)
             # 重新获取种子列表：替代资源若与原种子文件同名同目录，会被识别为共用数据，删除时保留文件
             fresh, error = downloader_obj.get_torrents()
-            return self._delete_torrent(downloader_obj, torrent, fresh if not error and fresh else all_torrents, prefix), None
+            deleted = self._delete_torrent(downloader_obj, torrent, fresh if not error and fresh else all_torrents, prefix)
+            self._events['replaced'].append(
+                f"• {self._short(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ↳ {detail}"
+                + ("" if deleted else "\n  （原种子删除失败，请手动处理）"))
+            return deleted, None
+        fail_reason = detail
 
         first_miss = not miss
         misses[torrent.hash] = {'ts': now, 'count': (miss or {}).get('count', 0) + 1}
@@ -1258,6 +1296,8 @@ class QbOptimizerPlus(_PluginBase):
         logger.warning(f"{prefix}{fail_reason}，保留原种子: {torrent.name}")
         if not first_miss:
             return False, None
+        self._events['kept'].append(
+            f"• {self._short(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ✗ {fail_reason}（6小时后再搜）")
         return False, {
             'name': torrent_info['name'],
             'hash': torrent_info['hash'],
@@ -1745,6 +1785,9 @@ class QbOptimizerPlus(_PluginBase):
                         f"大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | 分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
             if self._delete_torrent(downloader_obj, torrent, torrents, prefix):
                 removed += 1
+                self._events['deleted'].append(
+                    f"• {self._short(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n"
+                    f"  原因：识别不到媒体信息（持续1小时以上{'，AI也未能确认' if self._ai_enabled else ''}）")
         return removed
 
     def _handle_error_torrents(self, downloader_obj, torrents, downloader_name):
@@ -1806,22 +1849,23 @@ class QbOptimizerPlus(_PluginBase):
                 record['notified'] = True
             records[torrent.hash] = record
 
-        if to_notify and self._notify:
+        if to_notify:
             lines = []
             for torrent, hours, completed, keep_reason in to_notify:
                 if completed:
-                    plan = "已完成的种子不会自动删除"
+                    plan = "已下载完成，只重试不删除"
                 elif keep_reason:
-                    plan = "命中过滤设置，不会自动删除"
+                    plan = f"{keep_reason}，只重试不删除"
                 elif self._error_timeout_hours > 0:
-                    plan = f"报错满{self._error_timeout_hours}小时将删除并重新下载"
+                    left = max(self._error_timeout_hours - hours, 0)
+                    plan = f"约 {left:.0f} 小时后删除并搜索替代资源"
                 else:
-                    plan = "未开启超时删除"
-                lines.append(f"- {torrent.name}\n  状态: {getattr(torrent, 'state', '')} | 已报错{hours:.1f}小时 | "
-                             f"路径: {getattr(torrent, 'save_path', '')}\n  {plan}")
-            self.post_message(mtype=NotificationType.Manual,
-                              title=f"【QB种子优化Plus】{len(to_notify)}个种子重试3次仍报错",
-                              text="\n".join(lines) + "\n\n常见原因：磁盘写满、保存路径不可写或挂载断开、文件被删除或移动")
+                    plan = "未开启超时删除，需手动处理"
+                lines.append(f"• {self._short(torrent.name)}\n  {getattr(torrent, 'state', '')} · 已报错 {hours:.1f} 小时 · "
+                             f"进度 {getattr(torrent, 'progress', 0) * 100:.0f}%\n  路径：{getattr(torrent, 'save_path', '')}\n  处理：{plan}")
+            self._send('error', f"❗ {self._notify_prefix}｜{len(to_notify)} 个种子重试 3 次仍报错",
+                       self._section("报错种子", lines)
+                       + "\n常见原因：磁盘写满、保存路径不可写或挂载断开、文件被删除或移动")
 
         removed = 0
         redownload_failed = []
@@ -2062,23 +2106,13 @@ class QbOptimizerPlus(_PluginBase):
                 if success:
                     logger.info(f"【功能4-磁盘监控】下载速度限制成功: {self._speed_limit_mbps}MB/s")
                     
-                    # 发送通知（不包含磁盘空间信息，因为已在优化前检测过）
-                    if self._notify and notification_data:
-                        notification_title = "【QB种子优化】I/O资源不足，已限制下载速度"
-                        notification_text = f"持续监测{notification_data['monitor_count']}次，发现以下I/O问题:\n"
-                        if notification_data['cache_issues'] > 0:
-                            notification_text += f"• I/O缓存过高: {notification_data['cache_issues']}/{notification_data['monitor_count']}次 (平均: {notification_data['avg_cache_overload']:.1f}%, 阈值: {self._io_cache_threshold}%)\n"
-                        if notification_data['queue_issues'] > 0:
-                            notification_text += f"• I/O队列过高: {notification_data['queue_issues']}/{notification_data['monitor_count']}次 (平均: {notification_data['avg_io_jobs']:.0f}, 阈值: {self._io_queue_threshold})\n"
-                        notification_text += f"\n已自动限制下载速度为: {self._speed_limit_mbps}MB/s"
-                        
-                        self.post_message(
-                            mtype=NotificationType.Manual,
-                            title=notification_title,
-                            text=notification_text
-                        )
-                        logger.info(f"【功能4-磁盘监控】已发送资源不足通知")
-                    
+                    if notification_data:
+                        n = notification_data['monitor_count']
+                        self._send('limit', "🐢 磁盘 I/O 压力过高，已限速",
+                                   f"写入缓存 平均 {notification_data['avg_cache_overload']:.0f}%（阈值 {self._io_cache_threshold}%，{notification_data['cache_issues']}/{n} 次超标）\n"
+                                   f"I/O 队列 平均 {notification_data['avg_io_jobs']:.0f}（阈值 {self._io_queue_threshold}，{notification_data['queue_issues']}/{n} 次超标）\n"
+                                   f"下载已限速 {self._speed_limit_mbps}MB/s，压力下降后自动解除")
+
                     return True
                 else:
                     logger.error(f"【功能4-磁盘监控】下载速度限制失败")
@@ -2094,21 +2128,11 @@ class QbOptimizerPlus(_PluginBase):
                 if success:
                     logger.info(f"【功能4-磁盘监控】下载速度恢复成功，已取消限制")
                     
-                    # 发送通知（不包含磁盘空间信息，因为已在优化前检测过）
-                    if self._notify and notification_data:
-                        notification_title = "【QB种子优化】I/O资源已恢复，已取消下载速度限制"
-                        notification_text = f"持续监测{notification_data['monitor_count']}次，I/O资源已恢复正常:\n"
-                        notification_text += f"• I/O缓存使用率: {notification_data['avg_cache_overload']:.1f}% (阈值: {self._io_cache_threshold}%) ✓\n"
-                        notification_text += f"• 队列I/O任务: {notification_data['avg_io_jobs']:.0f} (阈值: {self._io_queue_threshold}) ✓\n"
-                        notification_text += f"\n已自动取消下载速度限制"
-                        
-                        self.post_message(
-                            mtype=NotificationType.Manual,
-                            title=notification_title,
-                            text=notification_text
-                        )
-                        logger.info(f"【功能4-磁盘监控】已发送资源恢复通知")
-                    
+                    if notification_data:
+                        self._send('limit', "✅ 磁盘 I/O 已恢复，已解除限速",
+                                   f"写入缓存 平均 {notification_data['avg_cache_overload']:.0f}%（阈值 {self._io_cache_threshold}%）\n"
+                                   f"I/O 队列 平均 {notification_data['avg_io_jobs']:.0f}（阈值 {self._io_queue_threshold}）")
+
                     return True
                 else:
                     logger.error(f"【功能4-磁盘监控】下载速度恢复失败")
@@ -2370,13 +2394,13 @@ class QbOptimizerPlus(_PluginBase):
         new_oversize = [(t, r) for t, r in oversize if t.hash not in oversize_notified]
         for torrent, remaining in oversize:
             logger.warning(f"{prefix}剩余{StringUtils.str_filesize(remaining)}超过可用预算，当前空间下无法下载完成: {torrent.name}")
-        if new_oversize and self._notify:
-            self.post_message(
-                mtype=NotificationType.Manual,
-                title="【QB种子优化Plus】有种子超出可用空间，无法下载完成",
-                text=(f"可用预算: {StringUtils.str_filesize(max(budget_bytes, 0))}（剩余空间减去{self._min_disk_space_threshold}GB阈值）"
-                      + "".join(f"\n- {t.name}（还需 {StringUtils.str_filesize(r)}）" for t, r in new_oversize)
-                      + "\n\n请清理磁盘空间或手动处理这些种子"))
+        if new_oversize:
+            self._send('oversize', f"📦 {self._notify_prefix}｜{len(new_oversize)} 个种子超出可用空间",
+                       f"💾 剩余 {StringUtils.str_filesize(free_bytes)} − 阈值 {self._min_disk_space_threshold}G = 预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
+                       + self._section("当前空间下无法下载完成", [
+                           f"• {self._short(t.name)}\n  还需 {StringUtils.str_filesize(r)} · 进度 {getattr(t, 'progress', 0) * 100:.0f}%"
+                           for t, r in new_oversize])
+                       + "\n建议清理磁盘空间；要优先下载的种子可打上 keep 标签")
         oversize_notified.update(t.hash for t, _ in new_oversize)
         if not items:
             return False
@@ -2408,7 +2432,7 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 if downloader_obj.stop_torrents(ids=[torrent_hash]):
                     paused_by_plugin.add(torrent_hash)
-                    paused_names.append(torrent.name)
+                    paused_names.append(f"• {self._short(torrent.name)}\n  平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
                     logger.info(f"{prefix}暂停: {torrent.name}（平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}暂停失败: {torrent.name}")
@@ -2419,23 +2443,20 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 if downloader_obj.start_torrents(ids=[torrent_hash]):
                     paused_by_plugin.discard(torrent_hash)
-                    resumed_names.append(torrent.name)
+                    resumed_names.append(f"• {self._short(torrent.name)}\n  上次平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
                     logger.info(f"{prefix}恢复: {torrent.name}（上次平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}恢复失败: {torrent.name}")
             except Exception as e:
                 logger.error(f"{prefix}恢复异常: {torrent.name}, 错误: {e}")
 
-        if self._notify and (paused_names or resumed_names):
-            text = (f"剩余空间: {StringUtils.str_filesize(free_bytes)}（最小阈值 {self._min_disk_space_threshold}GB）\n"
-                    f"保留下载: {len(chosen)}个，需 {StringUtils.str_filesize(chosen_size)}，预计 {chosen_speed:.2f}MB/s\n")
-            if paused_names:
-                text += f"\n暂停 {len(paused_names)} 个:\n" + "\n".join(f"- {n}" for n in paused_names[:15])
-                if len(paused_names) > 15:
-                    text += f"\n…等{len(paused_names)}个"
-            if resumed_names:
-                text += f"\n恢复 {len(resumed_names)} 个:\n" + "\n".join(f"- {n}" for n in resumed_names[:15])
-            self.post_message(mtype=NotificationType.Manual, title="【QB种子优化Plus】下载阈值控制已调整", text=text)
+        if paused_names or resumed_names:
+            self._send('threshold', f"⚖️ {self._notify_prefix}｜下载调度：暂停 {len(paused_names)} · 恢复 {len(resumed_names)}",
+                       f"💾 剩余 {StringUtils.str_filesize(free_bytes)}｜预算 {StringUtils.str_filesize(max(budget_bytes, 0))}\n"
+                       f"⬇️ 保持下载 {len(chosen)} 个 · 需 {StringUtils.str_filesize(chosen_size)} · 约 {chosen_speed:.1f}MB/s"
+                       + (f"（含 keep {len(keep_hashes)} 个）" if keep_hashes else "") + "\n"
+                       + self._section("⏸ 暂停", paused_names)
+                       + self._section("▶️ 恢复", resumed_names))
         return bool(paused_names or resumed_names)
 
     def _re_download_torrent(self, torrent_info) -> Tuple[bool, str]:
@@ -2469,7 +2490,10 @@ class QbOptimizerPlus(_PluginBase):
 
         history[attempt_key] = {'count': attempts + 1, 'ts': int(time.time()), 'title': best.torrent_info.title}
         self._save_redownload_history(history)
-        return True, ""
+        ti = best.torrent_info
+        return True, (f"{self._short(ti.title)}\n     {getattr(ti, 'site_name', '') or '未知站点'} · 做种 {getattr(ti, 'seeders', 0)}"
+                      f" · {StringUtils.str_filesize(getattr(ti, 'size', 0) or 0)}"
+                      f"{'（第' + str(attempts + 1) + '次自动重下）' if attempts else ''}")
 
     @staticmethod
     def _redownload_key(meta, name: str) -> str:
@@ -2702,21 +2726,20 @@ class QbOptimizerPlus(_PluginBase):
                 #     if len(high_seed) > 5:
                 #         logger.info(f"  ... 还有 {len(high_seed) - 5} 个")
                 
-                status_msg = f"【{downloader_name}状态】\n"
-                status_msg += f"总种子数: {len(all_torrents)}\n"
-                status_msg += f"下载中: {len(downloading)}\n"
-                status_msg += f"做种中: {len(uploading)}\n"
-                status_msg += f"下载中显示无人做种（未复核）: {len(zero_seed)}\n"
-                # status_msg += f"高做种数: 已改为综合评分判断\n"
-                
+                errors = [t for t in all_torrents if (getattr(t, 'state', '') or '').lower() in ('error', 'missingfiles')]
+                try:
+                    paused_by_plugin = len(self.get_data('threshold_paused') or [])
+                except Exception:
+                    paused_by_plugin = 0
+                free_gb = self._get_free_space_gb(downloader_obj)
+                status_msg = (f"📊 总数 {len(all_torrents)}｜⬇️ 下载中 {len(downloading)}｜⬆️ 做种中 {len(uploading)}\n"
+                              f"⏸ 插件暂停 {paused_by_plugin}｜❗ 报错 {len(errors)}｜显示无人做种（未复核）{len(zero_seed)}\n"
+                              f"💾 剩余空间 {f'{free_gb:.1f}G' if free_gb is not None else '未知'}"
+                              f"（阈值控制最小保留 {self._min_disk_space_threshold}G）")
                 logger.info(f"【QB种子优化】状态消息: {status_msg}")
-                if self._notify:
-                    logger.info(f"【QB种子优化】发送状态通知")
-                    self.post_message(
-                        mtype=NotificationType.Download,
-                        title=f"【QB优化状态】",
-                        text=status_msg
-                    )
+                # 状态查询是主动请求，不受通知类型开关限制
+                self.post_message(mtype=NotificationType.Manual,
+                                  title=f"📊 {self._notify_prefix}｜{downloader_name} 状态", text=status_msg)
 
             except Exception as e:
                 logger.error(f"【QB种子优化】获取状态异常：{str(e)}")
@@ -2919,6 +2942,133 @@ class QbOptimizerPlus(_PluginBase):
                                             'rows': 3,
                                             'placeholder': '这些标签的种子将被跳过\n每行一个标签名',
                                             'prepend-inner-icon': 'mdi-tag-outline'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+
+                    # 通知设置
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'text': '通知设置'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'model': 'notify_types',
+                                            'label': '发送哪些通知',
+                                            'items': [{"title": v, "value": k} for k, v in self.NOTIFY_KINDS.items()]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'notify_prefix', 'label': '标题前缀', 'placeholder': 'QB优化Plus'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'notify_name_length', 'label': '名称最多显示字数',
+                                                  'placeholder': '40', 'type': 'number'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'notify_max_items', 'label': '每组最多列出',
+                                                  'placeholder': '10', 'type': 'number'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'notify_summary_title',
+                                            'label': '清理汇总标题模板（留空用默认）',
+                                            'placeholder': self.DEFAULT_SUMMARY_TITLE
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 7},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'notify_summary_body',
+                                            'label': '清理汇总正文模板（留空用默认）',
+                                            'rows': 3,
+                                            'placeholder': self.DEFAULT_SUMMARY_BODY
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '模板可用占位符：{前缀} {替换数} {保留数} {删除数} {替换列表} {保留列表} {删除列表} {下载器} {剩余空间} {时间}。'
+                                                    '列表占位符已包含小标题，没有内容时为空。每条记录包含名称、大小、进度、原因，替换记录还有新资源的站点、做种数和大小。'
+                                                    '每轮最多发送一条汇总，状态不变时不会重复提醒。'
                                         }
                                     }
                                 ]
@@ -3964,6 +4114,13 @@ class QbOptimizerPlus(_PluginBase):
             "redownload_max_attempts": 3,
             # AI 辅助识别
             "ai_enabled": False,
+            # 通知设置
+            "notify_types": ['summary', 'threshold', 'limit', 'error', 'oversize'],
+            "notify_prefix": "QB优化Plus",
+            "notify_name_length": 40,
+            "notify_max_items": 10,
+            "notify_summary_title": "",
+            "notify_summary_body": "",
             # 错误种子处理
             "enable_error_handle": True,
             "error_timeout_hours": 24,
