@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.4"
+    plugin_version = "1.10.5"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2104,6 +2104,8 @@ class QbOptimizerPlus(_PluginBase):
         now = int(time.time())
         delay = self._moved_clean_delay_minutes * 60
         removed = 0
+        # qB 最近一小时报告“文件不存在”的种子：已完成的这类种子文件已被移走/删除（整理记录可能已被智能助手删除）
+        qb_reasons = self._refresh_qb_error_reasons(downloader_obj, downloader_name)
         for torrent in torrents:
             if getattr(torrent, 'progress', 0) < 1:
                 continue
@@ -2119,6 +2121,19 @@ class QbOptimizerPlus(_PluginBase):
             records = self._get_transfer_records(torrent, files)
             moved = [r for r in records if getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move']
             if not moved:
+                reason = qb_reasons.get(torrent.name) or {}
+                if reason.get('category') == 'missing' and now - float(reason.get('ts') or 0) < 3600:
+                    try:
+                        downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=torrent.hash)
+                    except Exception as e:
+                        logger.warning(f"{prefix}删除种子记录失败: {torrent.name}, 错误: {e}")
+                        continue
+                    self._removed_hashes.add(torrent.hash)
+                    removed += 1
+                    logger.info(f"{prefix}已完成但文件已不在（qB读取不到，且无整理记录），删除种子记录: {torrent.name}")
+                    self._events['moved'].append(
+                        f"• {self._name(torrent.name)}\n  {StringUtils.str_filesize(getattr(torrent, 'size', 0))} · "
+                        f"文件已不在（无整理记录），删除种子记录")
                 continue
             failed = [r for r in records if not getattr(r, 'status', False)]
             try:
