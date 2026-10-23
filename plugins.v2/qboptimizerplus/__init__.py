@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.8"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1829,18 +1829,81 @@ class QbOptimizerPlus(_PluginBase):
                     f"  原因：识别不到媒体信息（持续1小时以上{'，AI也未能确认' if self._ai_enabled else ''}）")
         return removed
 
-    def _get_transfer_records(self, torrent_hash: str) -> list:
+    def _mp_download_roots(self) -> List[str]:
+        """MoviePilot 目录设置中的下载目录（MP 视角的路径），用于按源路径查询整理记录"""
+        try:
+            from app.helper.directory import DirectoryHelper
+            roots = [str(d.download_path) for d in DirectoryHelper().get_download_dirs() if d.download_path]
+        except Exception as e:
+            logger.debug(f"【QB种子优化】读取下载目录失败: {e}")
+            roots = []
+        return list(dict.fromkeys(r.replace('\\', '/').rstrip('/') for r in roots if r))
+
+    @staticmethod
+    def _record_ts(record) -> Optional[float]:
+        value = getattr(record, 'date', None)
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value)[:19], '%Y-%m-%d %H:%M:%S').timestamp()
+        except Exception:
+            return None
+
+    def _get_transfer_records(self, torrent, files=None) -> list:
+        """
+        该种子的整理记录：按种子 hash 查询，并按文件源路径查询（同一资源从多个站点重复添加时，
+        MP 只会把整理记录挂在其中一个 hash 上，其它副本的文件同样已被移走）。
+        只保留种子添加之后的记录，避免同一资源删除后重新下载时被旧记录误判。
+        """
         try:
             from app.db.transferhistory_oper import TransferHistoryOper
-            return TransferHistoryOper().list_by_hash(torrent_hash) or []
+            oper = TransferHistoryOper()
         except Exception as e:
-            logger.debug(f"【QB种子优化】查询整理记录失败 {torrent_hash}: {e}")
+            logger.debug(f"【QB种子优化】整理记录接口不可用: {e}")
             return []
+        records = {}
+        try:
+            for r in oper.list_by_hash(torrent.hash) or []:
+                records[getattr(r, 'id', id(r))] = r
+        except Exception as e:
+            logger.debug(f"【QB种子优化】按hash查询整理记录失败 {torrent.name}: {e}")
 
-    def _moved_by_mp(self, torrent_hash: str) -> bool:
+        names = [(getattr(f, 'name', '') or '').replace('\\', '/') for f in (files or [])] or [torrent.name]
+        tops = {n.split('/')[0] for n in names if n}
+        multi = any('/' in n for n in names)
+        save_path = (getattr(torrent, 'save_path', '') or '').replace('\\', '/').rstrip('/')
+        roots = list(dict.fromkeys(self._mp_download_roots() + ([save_path] if save_path else [])))
+        for root in roots:
+            for top in tops:
+                path = f"{root}/{top}"
+                try:
+                    if multi and hasattr(oper, 'list_success_by_src'):
+                        found = oper.list_success_by_src(src=path, recursive=True) or []
+                    else:
+                        found = [r for r in [oper.get_by_src(path)] if r]
+                except Exception as e:
+                    logger.debug(f"【QB种子优化】按路径查询整理记录失败 {path}: {e}")
+                    continue
+                for r in found:
+                    records[getattr(r, 'id', id(r))] = r
+
+        added_on = self._first_int_attr(torrent, ['added_on'])
+        result = []
+        for r in records.values():
+            ts = self._record_ts(r)
+            if added_on and ts is not None and ts < added_on - 60:
+                continue
+            result.append(r)
+        return result
+
+    def _moved_by_mp(self, downloader_obj, torrent) -> bool:
         """MoviePilot 已用“移动”方式成功整理过该种子的文件（下载目录里的文件已不在）"""
+        try:
+            files = downloader_obj.get_files(tid=torrent.hash) or []
+        except Exception:
+            files = []
         return any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move'
-                   for r in self._get_transfer_records(torrent_hash))
+                   for r in self._get_transfer_records(torrent, files))
 
     @staticmethod
     def _file_index(file, position: int) -> int:
@@ -1879,13 +1942,13 @@ class QbOptimizerPlus(_PluginBase):
         for torrent in torrents:
             if getattr(torrent, 'progress', 0) >= 1:
                 continue
-            records = self._get_transfer_records(torrent.hash)
-            if not records:
-                continue
             try:
                 files = downloader_obj.get_files(tid=torrent.hash) or []
             except Exception as e:
                 logger.debug(f"{prefix}获取文件列表失败 {torrent.name}: {e}")
+                continue
+            records = self._get_transfer_records(torrent, files)
+            if not records:
                 continue
             moved = self._moved_file_indexes(files, records)
             if not moved:
@@ -1939,12 +2002,14 @@ class QbOptimizerPlus(_PluginBase):
         """
         if getattr(torrent, 'progress', 0) >= 1:
             return False, None
-        records = self._get_transfer_records(torrent.hash)
-        if not any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move' for r in records):
-            return False, None
         try:
             files = downloader_obj.get_files(tid=torrent.hash) or []
         except Exception:
+            files = []
+        records = self._get_transfer_records(torrent, files)
+        if not any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move' for r in records):
+            return False, None
+        if not files:
             return True, None
         moved = self._moved_file_indexes(files, records)
         all_eps, moved_eps = set(), set()
@@ -1977,7 +2042,11 @@ class QbOptimizerPlus(_PluginBase):
                 continue
             if self._get_exclude_reason(torrent):
                 continue
-            records = self._get_transfer_records(torrent.hash)
+            try:
+                files = downloader_obj.get_files(tid=torrent.hash) or []
+            except Exception:
+                files = []
+            records = self._get_transfer_records(torrent, files)
             moved = [r for r in records if getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move']
             if not moved:
                 continue
@@ -2037,7 +2106,7 @@ class QbOptimizerPlus(_PluginBase):
             hours = (now - record['first']) / 3600
             completed = getattr(torrent, 'progress', 0) >= 1
             keep_reason = self._get_exclude_reason(torrent)
-            if self._moved_by_mp(torrent.hash):
+            if self._moved_by_mp(downloader_obj, torrent):
                 # 已在“处理被整理移走的文件”中跳过移走的文件并重新校验恢复；仍反复报错时通知，不删除
                 record['retries'] += 1
                 if record['retries'] >= 3 and not record.get('notified'):
@@ -2457,6 +2526,8 @@ class QbOptimizerPlus(_PluginBase):
     RUNNING_MARGIN = 0.5
     # 被暂停的种子每等待1小时增加的价值（相当于MB/s），保证慢种子最终也能轮到并下载完
     WAIT_CREDIT_PER_HOUR = 1.0
+    # 从未测到速度的种子（新添加的）按此速度估计，让新种子有机会试速，测到真实速度后以实测为准
+    UNKNOWN_SPEED_PRIOR = 1.0
 
     @staticmethod
     def _is_downloading_state(torrent) -> bool:
@@ -2469,6 +2540,12 @@ class QbOptimizerPlus(_PluginBase):
         except Exception:
             pass
         return state_lower in ('downloading', 'stalleddl', 'metadl', 'queueddl', 'forceddl')
+
+    def _never_started(self, torrent) -> bool:
+        """添加后从未开始下载的停止种子（MP 或 qB 设置导致添加即停止），视为等待调度"""
+        return (self._is_paused_state(torrent)
+                and self._first_int_attr(torrent, ['time_active']) <= 0
+                and self._first_int_attr(torrent, ['downloaded', 'completed']) <= 0)
 
     @staticmethod
     def _is_paused_state(torrent) -> bool:
@@ -2553,7 +2630,7 @@ class QbOptimizerPlus(_PluginBase):
             if getattr(torrent, 'progress', 0) >= 1.0:
                 continue
             if self._is_paused_state(torrent):
-                if torrent.hash in paused_by_plugin:
+                if torrent.hash in paused_by_plugin or self._never_started(torrent):
                     paused.append(torrent)
             elif self._is_downloading_state(torrent):
                 running.append(torrent)
@@ -2584,7 +2661,7 @@ class QbOptimizerPlus(_PluginBase):
                     speed = current if previous is None else 0.6 * current + 0.4 * previous
                     speed_ema[torrent.hash] = round(speed, 3)
             else:
-                speed = speed_ema.get(torrent.hash, 0.0)
+                speed = speed_ema.get(torrent.hash, self.UNKNOWN_SPEED_PRIOR)
             # 等待补偿：暂停期间按小时累积，恢复后保留到下载完成，避免慢种子永远轮不到
             record = wait_credit.get(torrent.hash) or {'credit': 0.0, 'ts': now}
             if not is_running:
@@ -2657,11 +2734,18 @@ class QbOptimizerPlus(_PluginBase):
                 logger.error(f"{prefix}暂停异常: {torrent.name}, 错误: {e}")
         for torrent_hash in to_resume:
             torrent, remaining, speed = info[torrent_hash][:3]
+            if torrent_hash in speed_ema:
+                speed_text = f"上次平均 {speed:.2f}MB/s"
+            elif self._never_started(torrent):
+                speed_text = "新添加，首次开始下载"
+            else:
+                speed_text = "速度未知，试速"
+
             try:
                 if downloader_obj.start_torrents(ids=[torrent_hash]):
                     paused_by_plugin.discard(torrent_hash)
-                    resumed_names.append(f"• {self._name(torrent.name)}\n  上次平均 {speed:.2f}MB/s · 还需 {StringUtils.str_filesize(remaining)}")
-                    logger.info(f"{prefix}恢复: {torrent.name}（上次平均{speed:.2f}MB/s，剩余{StringUtils.str_filesize(remaining)}）")
+                    resumed_names.append(f"• {self._name(torrent.name)}\n  {speed_text} · 还需 {StringUtils.str_filesize(remaining)}")
+                    logger.info(f"{prefix}恢复: {torrent.name}（{speed_text}，剩余{StringUtils.str_filesize(remaining)}）")
                 else:
                     logger.warning(f"{prefix}恢复失败: {torrent.name}")
             except Exception as e:
