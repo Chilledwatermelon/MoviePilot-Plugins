@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.2"
+    plugin_version = "1.10.3"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2275,10 +2275,18 @@ class QbOptimizerPlus(_PluginBase):
                 continue
 
             reason_text = self.ERROR_REASON_TEXT.get(record['reason'], '原因未知')
+            # 剩余空间充足却报“磁盘已满”：多为 qB(libtorrent 2.x) 内存映射写入 0 字节/被移走的文件触发 SIGBUS 被误报，
+            # 需要重新校验让 qB 重建文件；首次识别到时不等退避立即处理
+            stale_mmap = record['reason'] == 'nospace' and space_ok
+            if stale_mmap and not record.get('nospace_recheck'):
+                record['next_retry'] = 0
             if now < record.get('next_retry', 0):
                 logger.info(f"{prefix}{reason_text}，{(record['next_retry'] - now) / 60:.0f}分钟后再重试: {torrent.name}")
             elif space_ok:
-                if self._retry_error_torrent(downloader_obj, torrent, record['reason']):
+                if self._retry_error_torrent(downloader_obj, torrent, 'io' if stale_mmap else record['reason']):
+                    if stale_mmap:
+                        record['nospace_recheck'] = True
+                        reason_text = "剩余空间充足却报磁盘已满（qB内存映射文件失效），已重新校验"
                     record['retries'] += 1
                     # 退避重试：5、10、20…分钟，最长2小时，避免反复失败刷满日志
                     record['next_retry'] = now + min(300 * 2 ** (record['retries'] - 1), 7200)
@@ -2296,8 +2304,8 @@ class QbOptimizerPlus(_PluginBase):
             lines = []
             for torrent, hours, completed, keep_reason in to_notify:
                 if reasons_for.get(torrent.hash) == 'nospace':
-                    plan = (f"qB 显示剩余 {free_gb:.0f}G 但写入失败，属于存储问题（inode/合并盘/挂载/配额），"
-                            f"删掉重下也会失败，只退避重试，请检查存储") if free_gb is not None else "磁盘写入失败，请检查存储"
+                    plan = (f"剩余 {free_gb:.0f}G 充足，多为 qB 内存映射文件失效误报磁盘已满，已重新校验；"
+                            f"建议 qB 设置→高级→磁盘IO类型改为 POSIX 兼容并重启 qB") if free_gb is not None else "磁盘写入失败，请检查存储"
                 elif completed:
                     plan = "已下载完成，只重试不删除"
                 elif keep_reason:
