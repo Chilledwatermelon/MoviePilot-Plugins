@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.3"
+    plugin_version = "1.10.4"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2247,7 +2247,7 @@ class QbOptimizerPlus(_PluginBase):
         timeout_seconds = self._error_timeout_hours * 3600
         qb_reasons = self._refresh_qb_error_reasons(downloader_obj, downloader_name)
 
-        to_delete, to_notify = [], []
+        to_delete, to_notify, lost_completed = [], [], []
         for torrent in error_torrents:
             state = getattr(torrent, 'state', '')
             record = records.get(torrent.hash) or {'first': now, 'retries': 0, 'notified': False}
@@ -2264,6 +2264,21 @@ class QbOptimizerPlus(_PluginBase):
                     record['notified'] = True
                 records[torrent.hash] = record
                 logger.info(f"{prefix}文件已被MP整理移走过，由同步逻辑处理，不删除: {torrent.name}")
+                continue
+
+            # 曾经下载完成、现在文件不在了、又不是 MP 整理移走的：重新校验会把已完成的内容从头再下一遍，
+            # 只暂停并通知，由用户决定删除还是重下
+            if (self._first_int_attr(torrent, ['completion_on']) > 0
+                    and (state.lower() == 'missingfiles' or record['reason'] == 'missing')):
+                if not record.get('lost_stopped'):
+                    try:
+                        downloader_obj.stop_torrents(ids=[torrent.hash])
+                    except Exception as e:
+                        logger.warning(f"{prefix}暂停失败: {torrent.name}, 错误: {e}")
+                    record['lost_stopped'] = True
+                    lost_completed.append(torrent)
+                records[torrent.hash] = record
+                logger.warning(f"{prefix}曾经下载完成但文件已不在（非MP整理移走），已暂停，避免重新下载: {torrent.name}")
                 continue
 
             # 磁盘写入失败是存储问题，删掉重下同样会失败，不做超时替换
@@ -2298,6 +2313,12 @@ class QbOptimizerPlus(_PluginBase):
                 to_notify.append((torrent, hours, completed, keep_reason))
                 record['notified'] = True
             records[torrent.hash] = record
+
+        if lost_completed:
+            self._send('error', f"⚠️ {self._notify_prefix}｜{len(lost_completed)} 个已完成的种子文件不见了",
+                       "不是 MP 整理移走的，已暂停，避免把已下完的内容重新下载："
+                       + "".join(f"\n• {self._name(t.name)}" for t in lost_completed[:max(self._notify_max_items, 1)])
+                       + "\n请确认媒体库里是否已有；不需要的可在 qB 中删除种子")
 
         if to_notify:
             reasons_for = {t.hash: (records.get(t.hash) or {}).get('reason', '') for t, *_ in to_notify}
