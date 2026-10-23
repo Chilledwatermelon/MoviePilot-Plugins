@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -143,7 +143,7 @@ class QbOptimizerPlus(_PluginBase):
         logger.info("【QB种子优化】开始初始化插件...")
         self._removed_hashes = set()
         self._recognized_cache = set()
-        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': []}
+        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': [], 'synced': []}
         self._last_free_gb = None
         self._current_downloader = None
         logger.info(f"【QB种子优化】收到配置: {config}")
@@ -580,7 +580,7 @@ class QbOptimizerPlus(_PluginBase):
         total_priority_boosted = 0
         self._current_downloader = None
         self._ai_calls_this_run = 0
-        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': []}
+        self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': [], 'synced': []}
         self._last_free_gb = None
         total_timeout_removed = 0
         total_unrecognized_removed = 0
@@ -640,6 +640,8 @@ class QbOptimizerPlus(_PluginBase):
                     logger.info(f"【QB种子优化】开始执行优化操作...")
                     # 每一步都基于剔除了前面步骤已删除种子的列表，避免重复处理和空间计算错误
                     self._removed_hashes = set()
+                    if self._enable_moved_clean:
+                        self._sync_moved_files(downloader_obj, all_torrents)
                     zero_seed_removed, zero_seed_failed = self._clean_zero_seed_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
                     timeout_removed, timeout_failed = self._clean_timeout_torrents(
@@ -707,7 +709,7 @@ class QbOptimizerPlus(_PluginBase):
         'oversize': '超出可用空间的种子',
     }
     DEFAULT_SUMMARY_TITLE = "🧹 {前缀}｜{摘要}"
-    DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}{整理列表}"
+    DEFAULT_SUMMARY_BODY = "🖥 下载器：{下载器}　💾 剩余：{剩余空间}\n⏰ {时间}\n{替换列表}{保留列表}{删除列表}{同步列表}{整理列表}"
 
     class _SafeDict(dict):
         def __missing__(self, key):
@@ -773,8 +775,10 @@ class QbOptimizerPlus(_PluginBase):
             '保留列表': self._section("⚠️ 未找到替代资源，已保留原种子", events['kept']),
             '删除列表': self._section("🗑️ 已删除", events['deleted']),
             '整理数': len(events['moved']),
+            '同步数': len(events['synced']),
+            '同步列表': self._section("🔀 季包部分集数已整理，跳过这些文件继续下载", events['synced']),
             '摘要': ' · '.join(f"{label} {len(events[key])}" for label, key in
-                               [('替换', 'replaced'), ('保留', 'kept'), ('删除', 'deleted'), ('已整理', 'moved')] if events[key]),
+                               [('替换', 'replaced'), ('保留', 'kept'), ('删除', 'deleted'), ('跳过已整理文件', 'synced'), ('已整理', 'moved')] if events[key]),
             '整理列表': self._section("📤 文件已被MP整理移走，清理种子记录", events['moved']),
             '下载器': ', '.join(self._downloaders),
             '剩余空间': f"{self._last_free_gb:.1f}G" if self._last_free_gb is not None else '未知',
@@ -1297,6 +1301,20 @@ class QbOptimizerPlus(_PluginBase):
             return False, None
 
         torrent_info = self._snapshot_torrent(torrent)
+        partially_moved, remaining_eps = self._remaining_episodes(downloader_obj, torrent)
+        if partially_moved and remaining_eps is not None and not remaining_eps:
+            logger.info(f"{prefix}所有集数都已被MP整理，无需重新下载，只删除种子记录: {torrent.name}")
+            try:
+                downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=torrent.hash)
+            except Exception as e:
+                logger.warning(f"{prefix}删除种子记录失败: {torrent.name}, 错误: {e}")
+                return False, None
+            self._removed_hashes.add(torrent.hash)
+            self._events['moved'].append(f"• {self._name(torrent.name)}\n  所有集数均已整理，删除种子记录（原因：{reason}）")
+            return True, None
+        if remaining_eps:
+            torrent_info['episodes'] = sorted(remaining_eps)
+            logger.info(f"{prefix}部分集数已整理，替代资源只下载剩余集数 {torrent_info['episodes']}: {torrent.name}")
         ok, detail = self._re_download_torrent(torrent_info)
         if ok:
             misses.pop(torrent.hash, None)
@@ -1304,8 +1322,9 @@ class QbOptimizerPlus(_PluginBase):
             # 重新获取种子列表：替代资源若与原种子文件同名同目录，会被识别为共用数据，删除时保留文件
             fresh, error = downloader_obj.get_torrents()
             deleted = self._delete_torrent(downloader_obj, torrent, fresh if not error and fresh else all_torrents, prefix)
+            eps_note = f"\n  只下载未整理的 E{'、E'.join(str(e) for e in torrent_info['episodes'])}" if torrent_info.get('episodes') else ""
             self._events['replaced'].append(
-                f"• {self._name(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ↳ {detail}"
+                f"• {self._name(torrent.name)}\n  {self._brief(torrent_info)}\n  原因：{reason}\n  ↳ {detail}{eps_note}"
                 + ("" if deleted else "\n  （原种子删除失败，请手动处理）"))
             return deleted, None
         fail_reason = detail
@@ -1823,6 +1842,106 @@ class QbOptimizerPlus(_PluginBase):
         return any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move'
                    for r in self._get_transfer_records(torrent_hash))
 
+    @staticmethod
+    def _file_index(file, position: int) -> int:
+        value = file.get('index') if hasattr(file, 'get') else getattr(file, 'index', None)
+        return int(value) if isinstance(value, (int, float)) else position
+
+    def _moved_file_indexes(self, files, records) -> set:
+        """按文件相对路径匹配 MP 移动成功记录的源路径，得到已被移走的文件序号（与 qB/MP 的路径映射无关）"""
+        moved_src = [(getattr(r, 'src', '') or '').replace('\\', '/') for r in records
+                     if getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move']
+        indexes = set()
+        for position, file in enumerate(files or []):
+            name = (getattr(file, 'name', '') or '').replace('\\', '/')
+            if name and any(src == name or src.endswith('/' + name) for src in moved_src):
+                indexes.add(self._file_index(file, position))
+        return indexes
+
+    @staticmethod
+    def _file_episodes(name: str) -> set:
+        meta = MetaInfo(name.replace('\\', '/').split('/')[-1])
+        return set(getattr(meta, 'episode_list', None) or [])
+
+    def _sync_moved_files(self, downloader_obj, torrents):
+        """
+        MP 目录监控+移动：季包下载中途已完成的单集会被移走，qB 之后读这些文件（上传或校验）就会报错。
+        把已移走的文件设为不下载，并在有新移走的文件或已报错时重新校验一次，让 qB 放弃这些文件的数据，其余集数继续下载。
+        """
+        prefix = "【功能8-已整理移走】"
+        try:
+            handled = dict(self.get_data('moved_files_handled') or {})
+        except Exception:
+            handled = {}
+        current = {t.hash for t in torrents}
+        handled = {h: v for h, v in handled.items() if h in current}
+
+        for torrent in torrents:
+            if getattr(torrent, 'progress', 0) >= 1:
+                continue
+            records = self._get_transfer_records(torrent.hash)
+            if not records:
+                continue
+            try:
+                files = downloader_obj.get_files(tid=torrent.hash) or []
+            except Exception as e:
+                logger.debug(f"{prefix}获取文件列表失败 {torrent.name}: {e}")
+                continue
+            moved = self._moved_file_indexes(files, records)
+            if not moved:
+                continue
+            priorities = {self._file_index(f, i): getattr(f, 'priority', 1) for i, f in enumerate(files)}
+            to_skip = sorted(i for i in moved if priorities.get(i, 0) != 0)
+            state = (getattr(torrent, 'state', '') or '').lower()
+            errored = state in ('error', 'missingfiles')
+            already = set(handled.get(torrent.hash) or [])
+            if not to_skip and not errored and moved <= already:
+                continue
+            try:
+                if to_skip:
+                    downloader_obj.qbc.torrents_file_priority(torrent_hash=torrent.hash, file_ids=to_skip, priority=0)
+                downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
+                downloader_obj.start_torrents(ids=[torrent.hash])
+            except Exception as e:
+                logger.warning(f"{prefix}跳过已移走文件失败: {torrent.name}, 错误: {e}")
+                continue
+            handled[torrent.hash] = sorted(moved)
+            remaining = [f for i, f in enumerate(files) if self._file_index(f, i) not in moved and getattr(f, 'priority', 1) != 0]
+            logger.info(f"{prefix}{torrent.name}: 已被MP移走{len(moved)}个文件，设为不下载并重新校验，"
+                        f"剩余{len(remaining)}个文件继续下载{'（原为报错状态）' if errored else ''}")
+            self._events['synced'].append(
+                f"• {self._name(torrent.name)}\n  已整理 {len(moved)} 个文件，剩余 {len(remaining)} 个继续下载 · "
+                f"进度 {getattr(torrent, 'progress', 0) * 100:.0f}%" + ("\n  原为报错状态，已恢复" if errored else ""))
+        try:
+            self.save_data('moved_files_handled', handled)
+        except Exception as e:
+            logger.debug(f"{prefix}保存记录失败: {e}")
+
+    def _remaining_episodes(self, downloader_obj, torrent) -> Tuple[bool, Optional[set]]:
+        """
+        部分文件已被 MP 移走的未完成种子：返回 (是否有移走记录, 还没整理的集数)。
+        没有移走记录或无法按集区分时集数为 None（下载整个种子）。
+        """
+        if getattr(torrent, 'progress', 0) >= 1:
+            return False, None
+        records = self._get_transfer_records(torrent.hash)
+        if not any(getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move' for r in records):
+            return False, None
+        try:
+            files = downloader_obj.get_files(tid=torrent.hash) or []
+        except Exception:
+            return True, None
+        moved = self._moved_file_indexes(files, records)
+        all_eps, moved_eps = set(), set()
+        for position, file in enumerate(files):
+            eps = self._file_episodes(getattr(file, 'name', '') or '')
+            all_eps |= eps
+            if self._file_index(file, position) in moved:
+                moved_eps |= eps
+        if not all_eps:
+            return True, None
+        return True, all_eps - moved_eps
+
     def _clean_moved_torrents(self, downloader_obj, torrents, downloader_name):
         """
         MoviePilot 整理方式为“移动”时，文件移走后 qB 里的已完成种子只剩空壳（无法做种，也会占着列表）。
@@ -1904,13 +2023,13 @@ class QbOptimizerPlus(_PluginBase):
             completed = getattr(torrent, 'progress', 0) >= 1
             keep_reason = self._get_exclude_reason(torrent)
             if self._moved_by_mp(torrent.hash):
-                # 季包下载中途被 MP 移走了已完成的单集：重新校验会把移走的文件重新下载，替换会重下整包
-                keep_reason = keep_reason or "部分文件已被MP整理移走"
-                if not record.get('notified'):
-                    to_notify.append((torrent, hours, completed, keep_reason))
+                # 已在“处理被整理移走的文件”中跳过移走的文件并重新校验恢复；仍反复报错时通知，不删除
+                record['retries'] += 1
+                if record['retries'] >= 3 and not record.get('notified'):
+                    to_notify.append((torrent, hours, completed, keep_reason or "部分文件已被MP整理移走，已跳过这些文件"))
                     record['notified'] = True
                 records[torrent.hash] = record
-                logger.info(f"{prefix}文件已被MP整理移走过，不重新校验、不删除: {torrent.name}")
+                logger.info(f"{prefix}文件已被MP整理移走过，由同步逻辑处理，不删除: {torrent.name}")
                 continue
 
             if (timeout_seconds > 0 and now - record['first'] >= timeout_seconds
@@ -2739,8 +2858,10 @@ class QbOptimizerPlus(_PluginBase):
             save_path = original_torrent_info.get('save_path') or None
             logger.info(f"{prefix}提交下载: {torrent_info.title} | 站点={torrent_info.site_name} | "
                         f"下载器={self._current_downloader} | 目录={save_path or '默认'}")
+            episodes = set(original_torrent_info.get('episodes') or []) or None
             download_id = DownloadChain().download_single(
                 context=context,
+                episodes=episodes,
                 downloader=self._current_downloader,
                 save_path=save_path,
                 username=self.plugin_name,
@@ -3149,7 +3270,7 @@ class QbOptimizerPlus(_PluginBase):
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'density': 'compact',
-                                            'text': '模板可用占位符：{前缀} {摘要}（只列出有发生的类别） {替换数} {保留数} {删除数} {整理数} {替换列表} {保留列表} {删除列表} {整理列表} {下载器} {剩余空间} {时间}。'
+                                            'text': '模板可用占位符：{前缀} {摘要}（只列出有发生的类别） {替换数} {保留数} {删除数} {整理数} {同步数} {替换列表} {保留列表} {删除列表} {同步列表} {整理列表} {下载器} {剩余空间} {时间}。'
                                                     '列表占位符已包含小标题，没有内容时为空。每条记录包含名称、大小、进度、原因，替换记录还有新资源的站点、做种数和大小。'
                                                     '每轮最多发送一条汇总，状态不变时不会重复提醒。'
                                         }
@@ -3422,7 +3543,7 @@ class QbOptimizerPlus(_PluginBase):
                                 'content': [
                                     {
                                         'component': 'VDivider',
-                                        'props': {'text': '清理已被整理移走的种子'}
+                                        'props': {'text': '处理被整理移走的文件（目录监控）'}
                                     }
                                 ]
                             }
@@ -3437,7 +3558,7 @@ class QbOptimizerPlus(_PluginBase):
                                 'content': [
                                     {
                                         'component': 'VSwitch',
-                                        'props': {'model': 'enable_moved_clean', 'label': '启用清理已整理移走的种子'}
+                                        'props': {'model': 'enable_moved_clean', 'label': '处理被MP整理移走的文件'}
                                     }
                                 ]
                             },
@@ -3466,8 +3587,9 @@ class QbOptimizerPlus(_PluginBase):
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'density': 'compact',
-                                            'text': 'MP 整理方式为“移动”时，文件移走后 qB 里的已完成种子已无法做种。'
-                                                    '有 MP 移动成功记录的已完成种子会被删除种子记录，不删除任何文件。'
+                                            'text': '适配 MP 目录监控+移动：下载中的季包有单集被移走时，把这些文件设为不下载并重新校验一次，'
+                                                    '避免 qB 读不到文件而报错，其余集数继续下载；需要换资源时只下载还没整理的集数；'
+                                                    '已完成且已移走的种子只删除种子记录，不删除任何文件。'
                                         }
                                     }
                                 ]
