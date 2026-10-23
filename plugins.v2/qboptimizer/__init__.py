@@ -2,6 +2,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any, Optional
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -34,7 +35,7 @@ class QbOptimizer(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.9"
+    plugin_version = "1.10"
     # 插件作者
     plugin_author = "leG09"
     # 作者主页
@@ -93,8 +94,29 @@ class QbOptimizer(_PluginBase):
     _enable_download_threshold = False  # 启用下载阈值控制
     _min_disk_space_threshold = 50      # 最小磁盘空间阈值（GB）
 
+    # 过滤设置（每行一个，命中的种子不会被清理删除）
+    _exclude_keywords = ""
+    _exclude_categories = ""
+    _exclude_labels = ""
+
+    # 做种数据可靠性
+    _seed_check_grace_minutes = 30   # 种子实际活跃满N分钟后才判定无人做种
+    _probe_wait_seconds = 30         # 排队种子探测做种数的最长等待时间
+
+    # 重新下载
+    _redownload_min_seeders = 3      # 替代资源最少做种数
+    _redownload_size_tolerance = 50  # 替代资源与原种子大小允许偏差（%），0为不限制
+    _redownload_max_attempts = 3     # 同一资源最多自动重新下载次数
+
+    # qB 中表示“无限”的 ETA 值
+    QB_ETA_INFINITY = 8640000
+    PROBE_CACHE_TTL = 6 * 3600
+
     def init_plugin(self, config: dict = None):
         logger.info("【QB种子优化】开始初始化插件...")
+        self._removed_hashes = set()
+        self._recognized_cache = set()
+        self._current_downloader = None
         logger.info(f"【QB种子优化】收到配置: {config}")
         
         if config:
@@ -147,7 +169,17 @@ class QbOptimizer(_PluginBase):
             # 下载阈值控制配置
             self._enable_download_threshold = config.get("enable_download_threshold", False)
             self._min_disk_space_threshold = float(config.get("min_disk_space_threshold", 50))
-            
+
+            self._exclude_keywords = config.get("exclude_keywords") or ""
+            self._exclude_categories = config.get("exclude_categories") or ""
+            self._exclude_labels = config.get("exclude_labels") or ""
+
+            self._seed_check_grace_minutes = int(config.get("seed_check_grace_minutes") or 30)
+            self._probe_wait_seconds = int(config.get("probe_wait_seconds") or 30)
+            self._redownload_min_seeders = int(config.get("redownload_min_seeders") or 3)
+            self._redownload_size_tolerance = int(config.get("redownload_size_tolerance", 50) or 0)
+            self._redownload_max_attempts = int(config.get("redownload_max_attempts") or 3)
+
             logger.info(f"【QB种子优化】配置加载完成:")
             logger.info(f"  - 启用状态: {self._enabled}")
             logger.info(f"  - 立即运行: {self._onlyonce}")
@@ -179,6 +211,9 @@ class QbOptimizer(_PluginBase):
             logger.info(f"  - 监测间隔: {self._monitor_interval}秒")
             logger.info(f"  - 下载阈值控制开关: {self._enable_download_threshold}")
             logger.info(f"  - 最小磁盘空间阈值: {self._min_disk_space_threshold}GB")
+            logger.info(f"  - 排除关键字: {self._split_lines(self._exclude_keywords)}")
+            logger.info(f"  - 排除分类: {self._split_lines(self._exclude_categories)}")
+            logger.info(f"  - 排除标签: {self._split_lines(self._exclude_labels)}")
         else:
             logger.warning("【QB种子优化】未收到配置，使用默认值")
 
@@ -202,45 +237,9 @@ class QbOptimizer(_PluginBase):
                 self._onlyonce = False
                 logger.info("【QB种子优化】已关闭立即运行开关")
                 
-                # 保存设置
-                config_to_save = {
-                    "enabled": self._enabled,
-                    "notify": self._notify,
-                    "onlyonce": self._onlyonce,
-                    "cron": self._cron,
-                    "downloaders": self._downloaders,
-                    "enable_zero_seed_clean": self._enable_zero_seed_clean,
-                    "enable_timeout_clean": self._enable_timeout_clean,
-                    "enable_unrecognized_clean": self._enable_unrecognized_clean,
-                    "enable_auto_redownload": self._enable_auto_redownload,
-                    "search_sites": self._search_sites,
-                    "zero_seed_threshold": self._zero_seed_threshold,
-
-                    "timeout_hours": self._timeout_hours,
-                    "max_download_slots": self._max_download_slots,
-                    "max_zero_seed_process": self._max_zero_seed_process,
-                    "max_timeout_process": self._max_timeout_process,
-                    "max_unrecognized_process": self._max_unrecognized_process,
-                    "max_priority_process": self._max_priority_process,
-                    # 综合评分配置
-                    "enable_score_priority": self._enable_score_priority,
-                    "speed_weight": self._speed_weight,
-                    "seeder_weight": self._seeder_weight,
-                    "min_score_threshold": self._min_score_threshold,
-                    # 磁盘空间和I/O监控配置
-                    "enable_disk_monitor": self._enable_disk_monitor,
-                    "disk_space_threshold": self._disk_space_threshold,
-                    "io_cache_threshold": self._io_cache_threshold,
-                    "io_queue_threshold": self._io_queue_threshold,
-                    "speed_limit_mbps": self._speed_limit_mbps,
-                    "monitor_duration": self._monitor_duration,
-                    "monitor_interval": self._monitor_interval,
-                    # 下载阈值控制配置
-                    "enable_download_threshold": self._enable_download_threshold,
-                    "min_disk_space_threshold": self._min_disk_space_threshold,
-                }
-                logger.info(f"【QB种子优化】保存配置: {config_to_save}")
-                self.update_config(config_to_save)
+                # 保存设置：沿用提交的完整配置，只关闭立即运行开关，避免新增配置项被覆盖丢失
+                config["onlyonce"] = False
+                self.update_config(config)
                 
                 if self._scheduler.get_jobs():
                     logger.info("【QB种子优化】调度器任务列表:")
@@ -563,6 +562,7 @@ class QbOptimizer(_PluginBase):
         
         total_zero_seed_removed = 0
         total_priority_boosted = 0
+        self._current_downloader = None
         total_timeout_removed = 0
         total_unrecognized_removed = 0
         all_failed_torrents = []  # 收集所有重新下载失败的种子
@@ -578,6 +578,7 @@ class QbOptimizer(_PluginBase):
                         logger.error(f"【QB种子优化】获取下载器失败: {downloader_name}")
                         continue
 
+                    self._current_downloader = downloader_name
                     logger.info(f"【QB种子优化】开始获取种子列表: {downloader_name}")
                     # 获取所有种子
                     all_torrents, error = downloader_obj.get_torrents()
@@ -616,16 +617,24 @@ class QbOptimizer(_PluginBase):
                     
                     # 执行各项优化
                     logger.info(f"【QB种子优化】开始执行优化操作...")
-                    zero_seed_removed, zero_seed_failed = self._clean_zero_seed_torrents(downloader_obj, all_torrents, downloader_name)
-                    priority_boosted = self._boost_priority_torrents(downloader_obj, all_torrents, downloader_name)
-                    timeout_removed, timeout_failed = self._clean_timeout_torrents(downloader_obj, all_torrents, downloader_name)
-                    unrecognized_removed = self._clean_unrecognized_torrents(downloader_obj, all_torrents, downloader_name)
-                    
+                    # 每一步都基于剔除了前面步骤已删除种子的列表，避免重复处理和空间计算错误
+                    self._removed_hashes = set()
+                    zero_seed_removed, zero_seed_failed = self._clean_zero_seed_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
+                    timeout_removed, timeout_failed = self._clean_timeout_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
+                    unrecognized_removed = self._clean_unrecognized_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
+                    priority_boosted = self._boost_priority_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
+
                     # 执行磁盘空间和I/O监控
                     disk_monitor_result = self._monitor_disk_and_io(downloader_obj, downloader_name)
-                    
-                    # 执行下载阈值控制
-                    download_threshold_result = self._manage_download_threshold(downloader_obj, all_torrents, downloader_name)
+
+                    # 执行下载阈值控制（优先级调整后状态已变化，重新获取种子列表）
+                    fresh_torrents, fresh_error = downloader_obj.get_torrents()
+                    threshold_torrents = fresh_torrents if not fresh_error and fresh_torrents else self._alive(all_torrents)
+                    download_threshold_result = self._manage_download_threshold(downloader_obj, threshold_torrents, downloader_name)
                     
                     total_zero_seed_removed += zero_seed_removed
                     total_priority_boosted += priority_boosted
@@ -701,142 +710,62 @@ class QbOptimizer(_PluginBase):
 
     def _clean_zero_seed_torrents(self, downloader_obj, torrents, downloader_name):
         """
-        清理下载中无人做种的任务并重新下载
+        清理下载中无人做种的任务并重新下载。
+        qB 的 num_complete 在 tracker 尚未返回 scrape 数据时会退回为“已知 peer 列表中的做种数”，
+        刚加入、刚恢复或刚出队的种子通常显示为 0，因此要经过多重校验才判定为无人做种。
         """
-        logger.info(f"【QB种子优化】开始清理下载中无人做种任务，功能开关: {self._enable_zero_seed_clean}")
-        logger.info("【QB种子优化】清理条件: 仅处理状态为 downloading 或 stalledDL 的任务")
-        
+        prefix = "【功能1-无人做种】"
         if not self._enable_zero_seed_clean:
-            logger.info("【QB种子优化】清理下载中无人做种功能已禁用，跳过")
+            logger.info(f"{prefix}功能已禁用，跳过")
             return 0, []
-            
-        # 记录重新下载失败的种子
-        redownload_failed_torrents = []
-            
-        logger.info(f"【功能1-无人做种】检查条件: 做种数阈值={self._zero_seed_threshold}, 目标状态=downloading/stalledDL")
-        
-        zero_seed_torrents = []
-        checked_count = 0
-        
+
+        logger.info(f"{prefix}检查条件: 做种数≤{self._zero_seed_threshold}, 状态=downloading/stalledDL, "
+                    f"实际活跃≥{self._seed_check_grace_minutes}分钟, 并以tracker返回数据复核")
+
+        candidates = []
         for torrent in torrents:
-            checked_count += 1
-            logger.debug(f"【QB种子优化】检查种子 {checked_count}/{len(torrents)}: {torrent.name}")
-            
-            # 仅处理 downloading 或 stalledDL
-            state_name = getattr(torrent, 'state', '') or ''
-            state_lower = state_name.lower()
-            is_target_state = state_lower in ('downloading', 'stalleddl')
-            seeder_count = self._get_seeder_count(torrent)
-            
-            # 添加详细的调试日志
-            if checked_count <= 10:  # 只显示前10个种子的详细信息
-                logger.info(f"【功能1-无人做种】种子检查详情 {checked_count}: {torrent.name}")
-                logger.info(f"  - 状态: {state_name} (state_lower={state_lower})")
-                logger.info(f"  - 是否目标状态(downloading/stalledDL): {is_target_state}")
-                logger.info(f"  - 做种数: {seeder_count} (阈值={self._zero_seed_threshold})")
-                logger.info(f"  - 原始字段: num_complete={getattr(torrent, 'num_complete', 'N/A')}, num_seeds={getattr(torrent, 'num_seeds', 'N/A')}, seeds={getattr(torrent, 'seeds', 'N/A')}")
-            
-            if is_target_state and seeder_count <= self._zero_seed_threshold:
-                
-                logger.debug(f"【功能1-无人做种】种子符合条件: {torrent.name}")
-                logger.debug(f"  - 状态: {state_name}")
-                logger.debug(f"  - 做种数: {seeder_count}")
-                logger.debug(f"  - 下载进度: {torrent.progress * 100:.1f}%")
-                
-                logger.info(f"【功能1-无人做种】添加待清理种子: {torrent.name}")
+            state_lower = (getattr(torrent, 'state', '') or '').lower()
+            if state_lower not in ('downloading', 'stalleddl'):
+                continue
+            if self._get_seeder_count(torrent) > self._zero_seed_threshold:
+                continue
+            candidates.append(torrent)
+        candidates = self._filter_excluded(candidates, prefix)
+
+        zero_seed_torrents = []
+        reannounce_hashes = []
+        for torrent in candidates:
+            verdict, detail = self._verify_no_seeders(downloader_obj, torrent)
+            if verdict == 'dead':
+                logger.info(f"{prefix}确认无人做种（{detail}）: {torrent.name}")
                 zero_seed_torrents.append(torrent)
-        
-        logger.info(f"【功能1-无人做种】检查完成，发现{len(zero_seed_torrents)}个下载中无人做种的任务")
-        
-        # 根据配置限制处理数量
+            else:
+                logger.info(f"{prefix}暂不清理（{detail}）: {torrent.name}")
+                if verdict == 'unknown':
+                    reannounce_hashes.append(torrent.hash)
+        if reannounce_hashes:
+            self._reannounce(downloader_obj, reannounce_hashes)
+            logger.info(f"{prefix}已让{len(reannounce_hashes)}个做种数据未就绪的种子重新汇报tracker，下次运行再判断")
+
+        logger.info(f"{prefix}检查完成: 候选{len(candidates)}个, 确认无人做种{len(zero_seed_torrents)}个")
         if len(zero_seed_torrents) > self._max_zero_seed_process:
-            logger.info(f"【功能1-无人做种】种子数量({len(zero_seed_torrents)})超过配置限制({self._max_zero_seed_process})，只处理前{self._max_zero_seed_process}个")
+            logger.info(f"{prefix}超过每次处理上限{self._max_zero_seed_process}，只处理前{self._max_zero_seed_process}个")
             zero_seed_torrents = zero_seed_torrents[:self._max_zero_seed_process]
-        
-        if zero_seed_torrents:
-            logger.info(f"【功能1-无人做种】开始删除下载中无人做种的任务并重新下载...")
-            for i, torrent in enumerate(zero_seed_torrents, 1):
-                logger.info(f"【功能1-无人做种】删除审计-开始 ({i}/{len(zero_seed_torrents)}): {torrent.name}")
-                logger.info(f"  - HASH: {getattr(torrent, 'hash', 'N/A')}")
-                logger.info(f"  - 做种数: {self._get_seeder_count(torrent)}")
-                logger.info(f"  - 下载进度: {torrent.progress * 100:.1f}%")
-                logger.info(f"  - 大小: {StringUtils.str_filesize(torrent.size)}")
-                logger.info(f"  - 状态: {getattr(torrent, 'state', 'unknown')}")
-                logger.info(f"  - 分类: {getattr(torrent, 'category', 'N/A')}")
-                logger.info(f"  - 标签: {getattr(torrent, 'tags', 'N/A')}")
-                logger.info(f"  - Tracker: {getattr(torrent, 'tracker', 'N/A')}")
-                
-                try:
-                    # 先记录种子信息用于重新下载（包含下载目录）
-                    torrent_info = {
-                        'name': torrent.name,
-                        'size': torrent.size,
-                        'hash': torrent.hash,
-                        'tracker': getattr(torrent, 'tracker', ''),
-                        'category': getattr(torrent, 'category', ''),
-                        'tags': getattr(torrent, 'tags', ''),
-                        'save_path': getattr(torrent, 'save_path', '') or getattr(torrent, 'content_path', '')
-                    }
-                    
-                    # 删除种子和文件
-                    torrent_hash = getattr(torrent, 'hash', '')
-                    logger.info(f"【功能1-无人做种】准备删除种子和文件: {torrent.name}, HASH: {torrent_hash}")
-                    
-                    # 尝试直接使用 qBittorrent API 删除，确保文件被删除
-                    try:
-                        if hasattr(downloader_obj, 'qbc') and downloader_obj.qbc:
-                            # 直接使用 qBittorrent API 删除，delete_files=True 表示删除文件
-                            downloader_obj.qbc.torrents_delete(delete_files=True, torrent_hashes=torrent_hash)
-                            logger.info(f"【功能1-无人做种】通过 qBittorrent API 删除成功: {torrent.name}")
-                            result = True
-                        else:
-                            # 回退到使用封装方法
-                            result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                            logger.info(f"【功能1-无人做种】通过封装方法删除: {torrent.name}, 结果: {result}")
-                    except Exception as e:
-                        logger.error(f"【功能1-无人做种】删除种子异常: {torrent.name}, 错误: {str(e)}")
-                        # 回退到使用封装方法
-                        result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                    
-                    if result:
-                        logger.info(f"【功能1-无人做种】删除审计-成功: {torrent.name} (HASH={torrent_hash})，已删除种子与数据文件")
-                        # 重新下载逻辑
-                        if self._enable_auto_redownload and self._search_sites:
-                            logger.info(f"【功能1-无人做种】开始搜索同名种子文件，做种数最多的作为下载任务")
-                            redownload_success = self._re_download_torrent(torrent_info)
-                            if not redownload_success:
-                                redownload_failed_torrents.append({
-                                    'name': torrent.name,
-                                    'hash': getattr(torrent, 'hash', 'N/A'),
-                                    'size': StringUtils.str_filesize(torrent.size),
-                                    'category': getattr(torrent, 'category', 'N/A'),
-                                    'tags': getattr(torrent, 'tags', 'N/A'),
-                                    'tracker': getattr(torrent, 'tracker', 'N/A'),
-                                    'reason': '无人做种'
-                                })
-                        elif not self._search_sites:
-                            logger.info(f"【功能1-无人做种】未配置搜索站点，跳过重新下载: {torrent.name}")
-                        else:
-                            logger.info(f"【功能1-无人做种】自动重新下载已禁用，跳过重新下载: {torrent.name}")
-                    else:
-                        logger.error(f"【功能1-无人做种】删除审计-失败: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')})")
-                    
-                except Exception as e:
-                    logger.error(f"【功能1-无人做种】删除审计-异常: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')}), 错误: {str(e)}")
-        
-        # 输出重新下载失败总结
-        if redownload_failed_torrents:
-            logger.warning(f"【功能1-无人做种】重新下载失败总结: 共{len(redownload_failed_torrents)}个种子")
-            for i, failed_torrent in enumerate(redownload_failed_torrents, 1):
-                logger.warning(f"  {i}. {failed_torrent['name']}")
-                logger.warning(f"     - HASH: {failed_torrent['hash']}")
-                logger.warning(f"     - 大小: {failed_torrent['size']}")
-                logger.warning(f"     - 分类: {failed_torrent['category']}")
-                logger.warning(f"     - 标签: {failed_torrent['tags']}")
-                logger.warning(f"     - Tracker: {failed_torrent['tracker']}")
-                logger.warning(f"     - 原因: {failed_torrent['reason']}")
-        
-        return len(zero_seed_torrents), redownload_failed_torrents
+
+        removed = 0
+        redownload_failed_torrents = []
+        for i, torrent in enumerate(zero_seed_torrents, 1):
+            logger.info(f"{prefix}删除审计 ({i}/{len(zero_seed_torrents)}): {torrent.name} | HASH={torrent.hash} | "
+                        f"进度={getattr(torrent, 'progress', 0) * 100:.1f}% | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | "
+                        f"分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
+            torrent_info = self._snapshot_torrent(torrent)
+            if not self._delete_torrent(downloader_obj, torrent, torrents, prefix):
+                continue
+            removed += 1
+            failed = self._maybe_redownload(torrent_info, '无人做种', prefix)
+            if failed:
+                redownload_failed_torrents.append(failed)
+        return removed, redownload_failed_torrents
 
     def _boost_priority_torrents(self, downloader_obj, torrents, downloader_name):
         """
@@ -986,95 +915,25 @@ class QbOptimizer(_PluginBase):
         
         logger.info(f"【QB种子优化】检查完成，发现{len(high_seed_torrents)}个高做种数的种子")
         
-        # 根据配置限制处理数量
-        if len(high_seed_torrents) > self._max_priority_process:
-            logger.info(f"【功能3-综合评分】种子数量({len(high_seed_torrents)})超过配置限制({self._max_priority_process})，只处理前{self._max_priority_process}个")
-            high_seed_torrents = high_seed_torrents[:self._max_priority_process]
-        
         if high_seed_torrents:
-            # 按照综合评分排序，评分最高的排在最前面
+            # 先按评分排序再截取，保证处理的是评分最高的一批
             high_seed_torrents.sort(key=lambda x: x['score'], reverse=True)
-            
-            logger.info(f"【QB种子优化】按综合评分排序后的种子列表:")
+            if len(high_seed_torrents) > self._max_priority_process:
+                logger.info(f"【功能3-综合评分】种子数量({len(high_seed_torrents)})超过配置限制({self._max_priority_process})，只处理评分最高的{self._max_priority_process}个")
+                high_seed_torrents = high_seed_torrents[:self._max_priority_process]
+
+            logger.info(f"【功能3-综合评分】按综合评分排序后的种子列表:")
             for i, torrent_info in enumerate(high_seed_torrents, 1):
-                torrent = torrent_info['torrent']
-                score = torrent_info['score']
-                seeder_count = torrent_info['seeder_count']
-                dlspeed = torrent_info['dlspeed']
-                progress = torrent_info['progress']
-                logger.info(f"  {i}. {torrent.name}")
-                logger.info(f"     综合评分: {score:.2f}, 做种数: {seeder_count}, 下载速度: {StringUtils.str_filesize(dlspeed)}/s, 进度: {progress:.1f}%")
-            
-            logger.info(f"【QB种子优化】开始设置种子下载优先级...")
-            logger.info(f"【QB种子优化】策略: 彻底重置优先级，按做种数重新排序")
-            
+                logger.info(f"  {i}. 评分{torrent_info['score']:.2f} | 做种{torrent_info['seeder_count']} | "
+                            f"{StringUtils.str_filesize(torrent_info['dlspeed'])}/s | 进度{torrent_info['progress']:.1f}% | {torrent_info['torrent'].name}")
+
+            # qB 的 API 调用是同步的：从最后一名到第一名依次置顶，第1名最终排在最前，无需先移到底部或等待
             total_count = len(high_seed_torrents)
             success_count = 0
-            
-            # 第一步：先将所有种子移到底部，清除历史优先级
-            logger.info(f"【QB种子优化】第一步：将所有{total_count}个种子移到底部，清除历史优先级")
-            for i, torrent_info in enumerate(high_seed_torrents, 1):
-                torrent = torrent_info['torrent']
-                score = torrent_info['score']
-                logger.info(f"【QB种子优化】移到底部 {i}/{total_count}: {torrent.name} (综合评分: {score:.2f})")
-                
-                try:
-                    # 先移到底部，清除历史优先级
-                    bottom_result = self._set_qb_torrent_priority(downloader_obj, torrent.hash, 999)
-                    
-                    if bottom_result:
-                        success_count += 1
-                        logger.debug(f"【QB种子优化】移到底部成功: {torrent.name}")
-                    else:
-                        logger.error(f"【QB种子优化】移到底部失败: {torrent.name}")
-                        
-                except Exception as e:
-                    logger.error(f"【QB种子优化】移到底部时发生异常: {torrent.name}, 错误: {str(e)}")
-            
-            logger.info(f"【QB种子优化】第一步完成：成功移到底部 {success_count}/{total_count} 个种子")
-            
-            # 等待一下让qBittorrent处理完
-            logger.info(f"【QB种子优化】等待2秒让qBittorrent处理优先级变更...")
-            time.sleep(2)
-            
-            # 第二步：从最后一名开始置顶，确保第1名最终在最前面
-            logger.info(f"【QB种子优化】第二步：从最后一名开始置顶，第1名最后置顶")
-            # 倒序处理：从最后一名到第一名
-            for i in range(total_count, 0, -1):
-                torrent_info = high_seed_torrents[i - 1]  # 索引从0开始
-                torrent = torrent_info['torrent']
-                score = torrent_info['score']
-                logger.info(f"【QB种子优化】置顶第{i}名/{total_count}: {torrent.name} (综合评分: {score:.2f})")
-                
-                try:
-                    # 置顶，建立新的排序
-                    top_result = self._set_qb_torrent_priority(downloader_obj, torrent.hash, 1)
-                    
-                    if top_result:
-                        logger.info(f"【QB种子优化】置顶成功: {torrent.name} (第{i}名)")
-                    else:
-                        logger.error(f"【QB种子优化】置顶失败: {torrent.name}")
-                    
-                    # 每次置顶后稍等一下，确保顺序正确
-                    if i > 1:  # 不是最后一次（第1名）
-                        time.sleep(0.5)
-                        
-                except Exception as e:
-                    logger.error(f"【QB种子优化】置顶时发生异常: {torrent.name}, 错误: {str(e)}")
-            
-            # 第三步：验证最终排序
-            logger.info(f"【QB种子优化】第三步：验证最终排序结果")
-            logger.info(f"【QB种子优化】期望的最终排序（按综合评分从高到低）:")
-            for i, torrent_info in enumerate(high_seed_torrents, 1):
-                torrent = torrent_info['torrent']
-                score = torrent_info['score']
-                seeder_count = torrent_info['seeder_count']
-                dlspeed = torrent_info['dlspeed']
-                progress = torrent_info['progress']
-                logger.info(f"  第{i}名: {torrent.name}")
-                logger.info(f"    综合评分: {score:.2f}, 做种数: {seeder_count}, 下载速度: {StringUtils.str_filesize(dlspeed)}/s")
-            
-            logger.info(f"【QB种子优化】优先级设置完成，请检查qBittorrent队列中的实际排序")
+            for torrent_info in reversed(high_seed_torrents):
+                if self._set_qb_torrent_priority(downloader_obj, torrent_info['torrent'].hash, 1):
+                    success_count += 1
+            logger.info(f"【功能3-综合评分】优先级设置完成: 成功置顶{success_count}/{total_count}个")
         else:
             # 无匹配时输出采样日志
             sample = torrents[:10]
@@ -1086,126 +945,299 @@ class QbOptimizer(_PluginBase):
 
     def _process_queued_torrents(self, downloader_obj, queued_torrents, high_seed_torrents):
         """
-        分批处理排队中的种子，启动获取做种数后决定是否继续下载
-        不合格的任务会被移到队列最后，避免重复处理
+        排队中的种子不会向 tracker 汇报，qB 显示的做种数通常是 0。
+        这里临时强制启动一小批种子并主动重新汇报，轮询到 tracker 返回数据后再取消强制启动，
+        不合格的移到队尾。探测结果缓存一段时间，避免每次运行重复探测。
         """
         if not queued_torrents:
             return
-            
-        # 简化批次处理，每次只处理少量种子
-        batch_size = 5  # 固定批次大小，避免负载过高
-        
-        total_batches = (len(queued_torrents) + batch_size - 1) // batch_size
-        
-        logger.info(f"【QB种子优化】分批处理排队种子: 总数{len(queued_torrents)}个，分{total_batches}批，每批{batch_size}个")
-        logger.info(f"【QB种子优化】批次处理详情:")
-        for batch_num in range(total_batches):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(queued_torrents))
-            batch_torrents = queued_torrents[start_idx:end_idx]
-            logger.info(f"  第{batch_num + 1}批: 处理 {start_idx + 1}-{end_idx} 号种子")
-            for idx, torrent in enumerate(batch_torrents, start_idx + 1):
-                queue_pos = self._get_queue_position(torrent)
-                logger.info(f"    {idx}. 队列位置 {queue_pos} | {torrent.name}")
-        
-        for batch_num in range(total_batches):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(queued_torrents))
-            batch_torrents = queued_torrents[start_idx:end_idx]
-            
-            logger.info(f"【QB种子优化】处理第{batch_num + 1}/{total_batches}批: {len(batch_torrents)}个种子")
-            
-            # 启动并置顶这一批种子
-            started_hashes = []
-            for torrent in batch_torrents:
-                try:
-                    queue_pos = self._get_queue_position(torrent)
-                    logger.info(f"【QB种子优化】启动并置顶种子获取做种数: 队列位置 {queue_pos} | {torrent.name}")
-                    # 先启动种子
-                    start_result = downloader_obj.start_torrents(ids=[torrent.hash])
-                    if start_result:
-                        # 再置顶种子，确保有下载速度
-                        priority_result = self._set_qb_torrent_priority(downloader_obj, torrent.hash, 1)
-                        if priority_result:
-                            started_hashes.append(torrent.hash)
-                            logger.debug(f"【QB种子优化】启动并置顶成功: {torrent.name}")
-                        else:
-                            logger.warning(f"【QB种子优化】置顶失败: {torrent.name}")
-                    else:
-                        logger.warning(f"【QB种子优化】启动失败: {torrent.name}")
-                except Exception as e:
-                    logger.error(f"【QB种子优化】启动种子异常: {torrent.name}, 错误: {str(e)}")
-            
-            if not started_hashes:
-                logger.warning(f"【QB种子优化】第{batch_num + 1}批没有成功启动的种子，跳过")
-                continue
-            
-            # 等待更长时间让种子获取到真实的做种数信息
-            logger.info(f"【QB种子优化】等待10秒让种子获取真实做种数信息...")
-            time.sleep(10)
-            
-            # 重新获取种子信息
+        prefix = "【功能3-排队探测】"
+        cache = self._load_probe_cache()
+        now = int(time.time())
+
+        to_probe = []
+        for torrent in queued_torrents:
+            cached = cache.get(torrent.hash)
+            if cached and now - cached.get('ts', 0) < self.PROBE_CACHE_TTL:
+                self._apply_queued_score(downloader_obj, torrent, cached.get('seeders', 0), 0,
+                                         high_seed_torrents, prefix, from_cache=True)
+            else:
+                to_probe.append(torrent)
+
+        batch_size = 10
+        for start in range(0, len(to_probe), batch_size):
+            batch = to_probe[start:start + batch_size]
+            hashes = [t.hash for t in batch]
+            logger.info(f"{prefix}探测第{start // batch_size + 1}批，共{len(batch)}个种子，最长等待{self._probe_wait_seconds}秒")
+            forced = self._set_force_start(downloader_obj, hashes, True)
+            speed_map = {}
+            results = {}
             try:
-                updated_torrents, error = downloader_obj.get_torrents(ids=started_hashes)
-                if error or not updated_torrents:
-                    logger.warning(f"【QB种子优化】无法获取更新后的种子信息")
+                self._reannounce(downloader_obj, hashes)
+                results = self._poll_tracker_seeders(downloader_obj, hashes)
+                refreshed, error = downloader_obj.get_torrents(ids=hashes)
+                if not error:
+                    speed_map = {t.hash: getattr(t, 'dlspeed', 0) for t in (refreshed or [])}
+            finally:
+                if forced:
+                    self._set_force_start(downloader_obj, hashes, False)
+
+            for torrent in batch:
+                seeders = results.get(torrent.hash)
+                if seeders is None:
+                    logger.info(f"{prefix}tracker未返回有效数据，保持原队列位置: {torrent.name}")
                     continue
-                
-                # 检查综合评分并决定是否继续下载
-                # 为了保持和队列顺序一致，按队列位置排序后再处理
-                try:
-                    updated_torrents.sort(key=lambda t: self._get_queue_position(t))
-                except Exception:
-                    pass
-                for torrent in updated_torrents:
-                    seeder_count = self._get_seeder_count(torrent)
-                    # 获取更多详细信息用于调试
-                    progress = getattr(torrent, 'progress', 0) * 100
-                    dlspeed = getattr(torrent, 'dlspeed', 0)
-                    state = getattr(torrent, 'state', 'unknown')
-                    
-                    # 计算综合评分：使用配置的权重
-                    speed_score = (dlspeed / (1024 * 1024)) * self._speed_weight  # 转换为MB/s并应用权重
-                    seeder_score = seeder_count * self._seeder_weight  # 做种数权重
-                    total_score = speed_score + seeder_score
-                    
-                    logger.info(f"【QB种子优化】种子综合评分检查: {torrent.name}")
-                    logger.info(f"  - 做种数: {seeder_count}")
-                    logger.info(f"  - 下载进度: {progress:.1f}%")
-                    logger.info(f"  - 下载速度: {StringUtils.str_filesize(dlspeed)}/s")
-                    logger.info(f"  - 状态: {state}")
-                    logger.info(f"  - 综合评分: {total_score:.2f} (速度:{speed_score:.2f} + 做种:{seeder_score:.2f})")
-                    
-                    if total_score >= self._min_score_threshold:
-                        logger.info(f"【QB种子优化】排队种子符合条件，加入优先级优化: {torrent.name} (综合评分: {total_score:.2f})")
-                        high_seed_torrents.append({
-                            'torrent': torrent,
-                            'score': total_score,
-                            'seeder_count': seeder_count,
-                            'dlspeed': dlspeed,
-                            'progress': progress
-                        })
-                    else:
-                        logger.info(f"【QB种子优化】排队种子综合评分不足，移到队列最后: {torrent.name} (综合评分: {total_score:.2f})")
-                        # 将不合格的种子移到队列最后，避免下次重复处理
-                        try:
-                            bottom_result = self._set_qb_torrent_priority(downloader_obj, torrent.hash, 999)  # 999表示底部
-                            if bottom_result:
-                                logger.info(f"【QB种子优化】已移到队列最后: {torrent.name}")
-                            else:
-                                logger.warning(f"【QB种子优化】移到队列最后失败: {torrent.name}")
-                        except Exception as e:
-                            logger.error(f"【QB种子优化】移到队列最后异常: {torrent.name}, 错误: {str(e)}")
-                
-            except Exception as e:
-                logger.error(f"【QB种子优化】处理第{batch_num + 1}批种子时发生异常: {str(e)}")
-            
-            # 批次间等待，避免负载过高
-            if batch_num < total_batches - 1:  # 不是最后一批
-                logger.info(f"【QB种子优化】等待3秒后处理下一批...")
-                time.sleep(3)
-        
-        logger.info(f"【QB种子优化】排队种子分批处理完成")
+                cache[torrent.hash] = {'seeders': seeders, 'ts': now}
+                self._apply_queued_score(downloader_obj, torrent, seeders, speed_map.get(torrent.hash, 0),
+                                         high_seed_torrents, prefix)
+
+        self._save_probe_cache(cache, now)
+
+    def _apply_queued_score(self, downloader_obj, torrent, seeders, dlspeed, high_seed_torrents, prefix, from_cache=False):
+        score = (dlspeed / (1024 * 1024)) * self._speed_weight + seeders * self._seeder_weight
+        source = "缓存" if from_cache else "探测"
+        if score >= self._min_score_threshold:
+            logger.info(f"{prefix}[{source}] 做种{seeders}，评分{score:.2f}，加入优先级排序: {torrent.name}")
+            high_seed_torrents.append({
+                'torrent': torrent,
+                'score': score,
+                'seeder_count': seeders,
+                'dlspeed': dlspeed,
+                'progress': getattr(torrent, 'progress', 0) * 100
+            })
+        else:
+            logger.info(f"{prefix}[{source}] 做种{seeders}，评分{score:.2f}低于{self._min_score_threshold}，移到队尾: {torrent.name}")
+            self._set_qb_torrent_priority(downloader_obj, torrent.hash, 999)
+
+    def _poll_tracker_seeders(self, downloader_obj, hashes: List[str]) -> Dict[str, Optional[int]]:
+        """轮询直到 tracker 返回做种数或超时。tracker 正常但不提供统计时，退回使用刷新后的 num_complete"""
+        results: Dict[str, Optional[int]] = {h: None for h in hashes}
+        working_without_stats = set()
+        pending = set(hashes)
+        deadline = time.time() + max(self._probe_wait_seconds, 5)
+        while pending and time.time() < deadline:
+            time.sleep(3)
+            for torrent_hash in list(pending):
+                status = self._get_tracker_seed_status(downloader_obj, torrent_hash)
+                if not status:
+                    continue
+                if status['max_seeders'] is not None:
+                    results[torrent_hash] = status['max_seeders']
+                    pending.discard(torrent_hash)
+                elif status['working']:
+                    working_without_stats.add(torrent_hash)
+                    pending.discard(torrent_hash)
+        if working_without_stats:
+            refreshed, error = downloader_obj.get_torrents(ids=list(working_without_stats))
+            if not error:
+                for torrent in refreshed or []:
+                    results[torrent.hash] = self._get_seeder_count(torrent)
+        return results
+
+    def _load_probe_cache(self) -> dict:
+        try:
+            return dict(self.get_data('queued_probe_cache') or {})
+        except Exception:
+            return {}
+
+    def _save_probe_cache(self, cache: dict, now: int):
+        cache = {h: v for h, v in cache.items() if now - v.get('ts', 0) < self.PROBE_CACHE_TTL}
+        try:
+            self.save_data('queued_probe_cache', cache)
+        except Exception as e:
+            logger.debug(f"【QB种子优化】保存探测缓存失败: {e}")
+
+    TRACKER_STATUS = {0: '禁用', 1: '未联系', 2: '工作中', 3: '更新中', 4: '出错'}
+
+    @staticmethod
+    def _tracker_field(tracker, key):
+        if hasattr(tracker, 'get'):
+            return tracker.get(key)
+        return getattr(tracker, key, None)
+
+    @staticmethod
+    def _to_int(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _get_tracker_seed_status(self, downloader_obj, torrent_hash: str) -> Optional[dict]:
+        """
+        读取种子各 tracker 的状态和做种数（tracker 返回的整个种群数据，比列表里的 num_complete 可靠）。
+        返回 max_seeders（无统计为None）、working（有tracker正常工作）和便于日志的摘要。
+        """
+        try:
+            trackers = downloader_obj.qbc.torrents_trackers(torrent_hash=torrent_hash)
+        except Exception as e:
+            logger.debug(f"【QB种子优化】获取tracker信息失败 {torrent_hash}: {e}")
+            return None
+        max_seeders = None
+        working = False
+        summary = []
+        for tracker in trackers or []:
+            url = str(self._tracker_field(tracker, 'url') or '')
+            if url.startswith('** ['):
+                continue
+            status = self._to_int(self._tracker_field(tracker, 'status'), -1)
+            seeds = self._to_int(self._tracker_field(tracker, 'num_seeds'), -1)
+            if status in (2, 3):
+                working = True
+                if seeds >= 0:
+                    max_seeders = seeds if max_seeders is None else max(max_seeders, seeds)
+            msg = self._tracker_field(tracker, 'msg') or ''
+            host = urlparse(url).netloc or url
+            summary.append(f"{host}:{self.TRACKER_STATUS.get(status, status)}{'/' + msg if msg else ''}")
+        return {
+            'max_seeders': max_seeders,
+            'working': working,
+            'summary': ', '.join(summary) or '无tracker'
+        }
+
+    def _verify_no_seeders(self, downloader_obj, torrent) -> Tuple[str, str]:
+        """
+        复核候选种子是否真的无人做种。
+        返回 (结论, 说明)，结论为 dead / alive / young / unknown。
+        """
+        active_seconds = self._first_int_attr(torrent, ['time_active'])
+        if active_seconds < self._seed_check_grace_minutes * 60:
+            return 'young', f"实际活跃{active_seconds // 60}分钟，未满{self._seed_check_grace_minutes}分钟"
+        if getattr(torrent, 'dlspeed', 0) > 0:
+            return 'alive', f"正在以{StringUtils.str_filesize(torrent.dlspeed)}/s下载"
+        connected_seeds = self._first_int_attr(torrent, ['num_seeds'])
+        if connected_seeds > 0:
+            return 'alive', f"已连接{connected_seeds}个做种者"
+        availability = getattr(torrent, 'availability', -1)
+        if isinstance(availability, (int, float)) and availability >= 1:
+            return 'alive', f"可用分布{availability:.2f}≥1，已连接用户拥有完整数据"
+
+        status = self._get_tracker_seed_status(downloader_obj, torrent.hash)
+        if status is None:
+            return 'unknown', "获取tracker信息失败"
+        if status['max_seeders'] is not None:
+            if status['max_seeders'] > self._zero_seed_threshold:
+                return 'alive', f"tracker报告做种数{status['max_seeders']}"
+            return 'dead', f"tracker报告做种数{status['max_seeders']}，已活跃{active_seconds // 60}分钟"
+        if status['working']:
+            return 'dead', f"tracker正常但未提供做种统计，活跃{active_seconds // 60}分钟内未连接到做种者"
+        return 'unknown', f"tracker尚未成功返回数据（{status['summary']}）"
+
+    def _reannounce(self, downloader_obj, hashes: List[str]):
+        try:
+            downloader_obj.qbc.torrents_reannounce(torrent_hashes=hashes)
+        except Exception as e:
+            logger.debug(f"【QB种子优化】重新汇报tracker失败: {e}")
+
+    def _set_force_start(self, downloader_obj, hashes: List[str], enable: bool) -> bool:
+        try:
+            downloader_obj.qbc.torrents_set_force_start(enable=enable, torrent_hashes=hashes)
+            return True
+        except Exception as e:
+            logger.warning(f"【QB种子优化】设置强制启动={enable}失败: {e}")
+            return False
+
+    def _alive(self, torrents: list) -> list:
+        return [t for t in torrents if t.hash not in self._removed_hashes]
+
+    @staticmethod
+    def _snapshot_torrent(torrent) -> dict:
+        return {
+            'name': torrent.name,
+            'size': getattr(torrent, 'size', 0),
+            'hash': torrent.hash,
+            'tracker': getattr(torrent, 'tracker', ''),
+            'category': getattr(torrent, 'category', ''),
+            'tags': getattr(torrent, 'tags', ''),
+            'save_path': getattr(torrent, 'save_path', '') or '',
+        }
+
+    def _delete_torrent(self, downloader_obj, torrent, all_torrents, prefix) -> bool:
+        """删除种子；若有其它种子共用同一份数据（辅种），只删种子保留文件"""
+        torrent_hash = torrent.hash
+        delete_files = True
+        content_path = getattr(torrent, 'content_path', '') or ''
+        if content_path:
+            shared = [t for t in all_torrents
+                      if t.hash != torrent_hash and (getattr(t, 'content_path', '') or '') == content_path]
+            if shared:
+                delete_files = False
+                logger.warning(f"{prefix}有{len(shared)}个其它种子共用这份数据（辅种），只删除种子、保留文件: {torrent.name}")
+        try:
+            downloader_obj.qbc.torrents_delete(delete_files=delete_files, torrent_hashes=torrent_hash)
+            ok = True
+        except Exception as e:
+            logger.warning(f"{prefix}API删除失败，改用封装方法: {torrent.name}, 错误: {e}")
+            try:
+                ok = bool(downloader_obj.delete_torrents(delete_file=delete_files, ids=[torrent_hash]))
+            except Exception as e2:
+                logger.error(f"{prefix}删除异常: {torrent.name}, 错误: {e2}")
+                ok = False
+        if ok:
+            self._removed_hashes.add(torrent_hash)
+            logger.info(f"{prefix}已删除{'种子与数据文件' if delete_files else '种子（保留文件）'}: {torrent.name}")
+        else:
+            logger.error(f"{prefix}删除失败: {torrent.name}")
+        return ok
+
+    def _maybe_redownload(self, torrent_info: dict, reason: str, prefix: str) -> Optional[dict]:
+        """按配置重新下载，失败时返回用于通知的失败记录"""
+        if not self._enable_auto_redownload:
+            logger.info(f"{prefix}自动重新下载已禁用: {torrent_info['name']}")
+            return None
+        if not self._search_sites:
+            logger.info(f"{prefix}未配置搜索站点，跳过重新下载: {torrent_info['name']}")
+            return None
+        ok, fail_reason = self._re_download_torrent(torrent_info)
+        if ok:
+            return None
+        return {
+            'name': torrent_info['name'],
+            'hash': torrent_info['hash'],
+            'size': StringUtils.str_filesize(torrent_info['size']),
+            'category': torrent_info.get('category') or 'N/A',
+            'tags': torrent_info.get('tags') or 'N/A',
+            'tracker': torrent_info.get('tracker') or 'N/A',
+            'reason': f"{reason}；{fail_reason}"
+        }
+
+    @staticmethod
+    def _split_lines(text) -> List[str]:
+        if not text:
+            return []
+        return [line.strip() for line in str(text).splitlines() if line.strip()]
+
+    def _get_exclude_reason(self, torrent) -> Optional[str]:
+        """命中排除条件时返回原因，否则返回None"""
+        name = getattr(torrent, 'name', '') or ''
+        name_lower = name.lower()
+        for keyword in self._split_lines(self._exclude_keywords):
+            if keyword.lower() in name_lower:
+                return f"名称包含排除关键字「{keyword}」"
+
+        category = (getattr(torrent, 'category', '') or '').strip()
+        if category and category in self._split_lines(self._exclude_categories):
+            return f"分类「{category}」在排除列表中"
+
+        exclude_labels = self._split_lines(self._exclude_labels)
+        if exclude_labels:
+            tags = [t.strip() for t in (getattr(torrent, 'tags', '') or '').split(',') if t.strip()]
+            for tag in tags:
+                if tag in exclude_labels:
+                    return f"标签「{tag}」在排除列表中"
+        return None
+
+    def _filter_excluded(self, torrents: list, log_prefix: str) -> list:
+        """从待清理列表中剔除命中排除条件的种子"""
+        kept = []
+        for torrent in torrents:
+            reason = self._get_exclude_reason(torrent)
+            if reason:
+                logger.info(f"{log_prefix}跳过（{reason}）: {getattr(torrent, 'name', '')}")
+            else:
+                kept.append(torrent)
+        if len(kept) != len(torrents):
+            logger.info(f"{log_prefix}过滤设置排除了{len(torrents) - len(kept)}个种子，剩余{len(kept)}个待清理")
+        return kept
 
     def _get_seeder_count(self, torrent) -> int:
         """获取做种数，支持多种度量方式：num_complete/connected/availability/auto"""
@@ -1349,286 +1381,156 @@ class QbOptimizer(_PluginBase):
             logger.error(f"【QB种子优化】设置优先级异常详情: {traceback.format_exc()}")
             return False
 
+    def _estimate_remaining_seconds(self, torrent) -> Optional[int]:
+        """预计剩余下载时间（秒），无法估算（速度为0）时返回None"""
+        eta = self._first_int_attr(torrent, ['eta'])
+        if 0 < eta < self.QB_ETA_INFINITY:
+            return eta
+        dlspeed = getattr(torrent, 'dlspeed', 0) or 0
+        if dlspeed > 0:
+            amount_left = getattr(torrent, 'amount_left', None)
+            if not isinstance(amount_left, (int, float)):
+                amount_left = getattr(torrent, 'size', 0) * (1 - getattr(torrent, 'progress', 0))
+            return int(amount_left / dlspeed)
+        return None
+
     def _clean_timeout_torrents(self, downloader_obj, torrents, downloader_name):
         """
-        清理预计下载时长超过N小时且已下载N小时的慢速任务
+        清理慢速任务：实际活跃时长超过N小时，且预计剩余时间也超过N小时（或速度为0无法估算）。
+        用 time_active（不含排队/暂停时间）而不是添加时间，避免排队很久的种子一开始下载就被清理；
+        预计快下完的种子不会被清理。
         """
-        logger.info(f"【功能2-慢速下载】开始清理慢速下载任务，功能开关: {self._enable_timeout_clean}")
-        
+        prefix = "【功能2-慢速下载】"
         if not self._enable_timeout_clean:
-            logger.info("【功能2-慢速下载】清理慢速下载功能已禁用，跳过")
+            logger.info(f"{prefix}功能已禁用，跳过")
             return 0, []
-            
-        # 记录重新下载失败的种子
-        redownload_failed_torrents = []
-            
-        current_time = int(time.time())
+
         timeout_seconds = self._timeout_hours * 3600
-        logger.info(f"【功能2-慢速下载】检查条件: 预计下载时长阈值={self._timeout_hours}小时, 超时秒数={timeout_seconds}秒, 目标状态=downloading/stalledDL")
-        
+        logger.info(f"{prefix}检查条件: 实际活跃>{self._timeout_hours}小时 且 预计剩余>{self._timeout_hours}小时, 状态=downloading/stalledDL")
+
         timeout_torrents = []
-        checked_count = 0
-        
         for torrent in torrents:
-            checked_count += 1
-            logger.debug(f"【QB种子优化】检查种子 {checked_count}/{len(torrents)}: {torrent.name}")
-            
-            # 检查是否为下载中状态且有种子
-            state_name = getattr(torrent, 'state', '') or ''
-            # 只处理 downloading 和 stalledDL 状态的任务
-            is_target_state = state_name in ['downloading', 'stalledDL']
-            
-            if is_target_state:
-                # 检查是否有种子
-                seeder_count = self._get_seeder_count(torrent)
-                if seeder_count > 0:  # 有种子
-                    # 计算已下载时长
-                    added_time = torrent.added_on
-                    downloaded_duration = current_time - added_time
-                    downloaded_hours = downloaded_duration / 3600
-                    
-                    # 计算预计下载时长
-                    # 基于当前下载速度和剩余大小计算
-                    progress = getattr(torrent, 'progress', 0)
-                    size = getattr(torrent, 'size', 0)
-                    dlspeed = getattr(torrent, 'dlspeed', 0)
-                    
-                    if progress > 0 and dlspeed > 0:
-                        # 计算剩余大小
-                        remaining_size = size * (1 - progress)
-                        # 计算预计剩余时间（秒）
-                        estimated_remaining_seconds = remaining_size / dlspeed
-                        # 计算总预计下载时长
-                        estimated_total_hours = (downloaded_duration + estimated_remaining_seconds) / 3600
-                    else:
-                        # 如果无法计算，使用已下载时长作为预计时长
-                        estimated_total_hours = downloaded_hours
-                    
-                    logger.debug(f"【功能2-慢速下载】种子慢速下载检查: {torrent.name}")
-                    logger.debug(f"  - 做种数: {seeder_count}")
-                    logger.debug(f"  - 已下载时长: {downloaded_hours:.1f}小时")
-                    logger.debug(f"  - 下载进度: {progress * 100:.1f}%")
-                    logger.debug(f"  - 下载速度: {StringUtils.str_filesize(dlspeed)}/s")
-                    logger.debug(f"  - 预计总时长: {estimated_total_hours:.1f}小时")
-                    logger.debug(f"  - 超时阈值: {self._timeout_hours}小时")
-                    
-                    # 只有当预计下载时长超过阈值且已下载时长也超过阈值时才清理
-                    if estimated_total_hours > self._timeout_hours and downloaded_hours > self._timeout_hours:
-                        logger.debug(f"【功能2-慢速下载】种子慢速下载超时: {torrent.name}")
-                        
-                        logger.info(f"【功能2-慢速下载】添加待清理慢速下载种子: {torrent.name}")
-                        timeout_torrents.append(torrent)
-        
-        logger.info(f"【功能2-慢速下载】检查完成，发现{len(timeout_torrents)}个慢速下载的种子")
-        
-        # 根据配置限制处理数量
+            state_lower = (getattr(torrent, 'state', '') or '').lower()
+            if state_lower not in ('downloading', 'stalleddl'):
+                continue
+            if self._get_seeder_count(torrent) <= self._zero_seed_threshold:
+                continue  # 无人做种的交给功能1复核处理
+            active_seconds = self._first_int_attr(torrent, ['time_active'])
+            if active_seconds <= timeout_seconds:
+                continue
+            remaining = self._estimate_remaining_seconds(torrent)
+            if remaining is not None and remaining <= timeout_seconds:
+                logger.debug(f"{prefix}活跃已超时但预计{remaining / 3600:.1f}小时内完成，保留: {torrent.name}")
+                continue
+            remaining_text = "无法估算（速度为0）" if remaining is None else f"{remaining / 3600:.1f}小时"
+            logger.info(f"{prefix}慢速任务: {torrent.name} | 活跃{active_seconds / 3600:.1f}小时 | 预计剩余{remaining_text} | "
+                        f"进度{getattr(torrent, 'progress', 0) * 100:.1f}%")
+            timeout_torrents.append((torrent, active_seconds, remaining_text))
+
+        kept = set(t.hash for t in self._filter_excluded([t for t, _, _ in timeout_torrents], prefix))
+        timeout_torrents = [item for item in timeout_torrents if item[0].hash in kept]
+        logger.info(f"{prefix}检查完成，发现{len(timeout_torrents)}个慢速任务")
         if len(timeout_torrents) > self._max_timeout_process:
-            logger.info(f"【功能2-慢速下载】种子数量({len(timeout_torrents)})超过配置限制({self._max_timeout_process})，只处理前{self._max_timeout_process}个")
+            logger.info(f"{prefix}超过每次处理上限{self._max_timeout_process}，只处理前{self._max_timeout_process}个")
             timeout_torrents = timeout_torrents[:self._max_timeout_process]
-        
-        if timeout_torrents:
-            logger.info(f"【功能2-慢速下载】开始删除慢速下载的种子...")
-            for i, torrent in enumerate(timeout_torrents, 1):
-                # 重新计算信息用于日志显示
-                added_time = torrent.added_on
-                downloaded_hours = (current_time - added_time) / 3600
-                progress = getattr(torrent, 'progress', 0)
-                dlspeed = getattr(torrent, 'dlspeed', 0)
-                size = getattr(torrent, 'size', 0)
-                
-                if progress > 0 and dlspeed > 0:
-                    remaining_size = size * (1 - progress)
-                    estimated_remaining_seconds = remaining_size / dlspeed
-                    estimated_total_hours = (downloaded_hours * 3600 + estimated_remaining_seconds) / 3600
-                else:
-                    estimated_total_hours = downloaded_hours
-                
-                logger.info(f"【功能2-慢速下载】删除审计-开始 ({i}/{len(timeout_torrents)}): {torrent.name}")
-                logger.info(f"  - HASH: {getattr(torrent, 'hash', 'N/A')}")
-                logger.info(f"  - 已下载时长: {downloaded_hours:.1f}小时")
-                logger.info(f"  - 预计总时长: {estimated_total_hours:.1f}小时")
-                logger.info(f"  - 下载进度: {progress * 100:.1f}%")
-                logger.info(f"  - 下载速度: {StringUtils.str_filesize(dlspeed)}/s")
-                logger.info(f"  - 做种数: {self._get_seeder_count(torrent)}")
-                logger.info(f"  - 大小: {StringUtils.str_filesize(torrent.size)}")
-                logger.info(f"  - 状态: {getattr(torrent, 'state', 'unknown')}")
-                logger.info(f"  - 分类: {getattr(torrent, 'category', 'N/A')}")
-                logger.info(f"  - 标签: {getattr(torrent, 'tags', 'N/A')}")
-                logger.info(f"  - Tracker: {getattr(torrent, 'tracker', 'N/A')}")
-                
-                try:
-                    # 删除种子和文件
-                    torrent_hash = getattr(torrent, 'hash', '')
-                    logger.info(f"【功能2-慢速下载】准备删除种子和文件: {torrent.name}, HASH: {torrent_hash}")
-                    
-                    # 尝试直接使用 qBittorrent API 删除，确保文件被删除
-                    try:
-                        if hasattr(downloader_obj, 'qbc') and downloader_obj.qbc:
-                            # 直接使用 qBittorrent API 删除，delete_files=True 表示删除文件
-                            downloader_obj.qbc.torrents_delete(delete_files=True, torrent_hashes=torrent_hash)
-                            logger.info(f"【功能2-慢速下载】通过 qBittorrent API 删除成功: {torrent.name}")
-                            result = True
-                        else:
-                            # 回退到使用封装方法
-                            result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                            logger.info(f"【功能2-慢速下载】通过封装方法删除: {torrent.name}, 结果: {result}")
-                    except Exception as e:
-                        logger.error(f"【功能2-慢速下载】删除种子异常: {torrent.name}, 错误: {str(e)}")
-                        # 回退到使用封装方法
-                        result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                    
-                    if result:
-                        logger.info(f"【功能2-慢速下载】删除审计-成功: {torrent.name} (HASH={torrent_hash})，已删除种子与数据文件")
-                        # 重新下载逻辑
-                        if self._enable_auto_redownload and self._search_sites:
-                            logger.info(f"【功能2-慢速下载】开始搜索同名种子文件，做种数最多的作为下载任务")
-                            torrent_info = {
-                                'name': torrent.name,
-                                'size': torrent.size,
-                                'hash': torrent.hash,
-                                'tracker': getattr(torrent, 'tracker', ''),
-                                'category': getattr(torrent, 'category', ''),
-                                'tags': getattr(torrent, 'tags', ''),
-                                'save_path': getattr(torrent, 'save_path', '') or getattr(torrent, 'content_path', '')
-                            }
-                            redownload_success = self._re_download_torrent(torrent_info)
-                            if not redownload_success:
-                                redownload_failed_torrents.append({
-                                    'name': torrent.name,
-                                    'hash': getattr(torrent, 'hash', 'N/A'),
-                                    'size': StringUtils.str_filesize(torrent.size),
-                                    'category': getattr(torrent, 'category', 'N/A'),
-                                    'tags': getattr(torrent, 'tags', 'N/A'),
-                                    'tracker': getattr(torrent, 'tracker', 'N/A'),
-                                    'reason': f'慢速下载{downloaded_hours:.1f}小时，预计{estimated_total_hours:.1f}小时'
-                                })
-                        elif not self._search_sites:
-                            logger.info(f"【功能2-慢速下载】未配置搜索站点，跳过重新下载: {torrent.name}")
-                        else:
-                            logger.info(f"【功能2-慢速下载】自动重新下载已禁用，跳过重新下载: {torrent.name}")
-                    else:
-                        logger.error(f"【功能2-慢速下载】删除审计-失败: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')})")
-                        
-                except Exception as e:
-                    logger.error(f"【功能2-慢速下载】删除审计-异常: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')}), 错误: {str(e)}")
-        
-        # 输出重新下载失败总结
-        if redownload_failed_torrents:
-            logger.warning(f"【功能2-慢速下载】重新下载失败总结: 共{len(redownload_failed_torrents)}个种子")
-            for i, failed_torrent in enumerate(redownload_failed_torrents, 1):
-                logger.warning(f"  {i}. {failed_torrent['name']}")
-                logger.warning(f"     - HASH: {failed_torrent['hash']}")
-                logger.warning(f"     - 大小: {failed_torrent['size']}")
-                logger.warning(f"     - 分类: {failed_torrent['category']}")
-                logger.warning(f"     - 标签: {failed_torrent['tags']}")
-                logger.warning(f"     - Tracker: {failed_torrent['tracker']}")
-                logger.warning(f"     - 原因: {failed_torrent['reason']}")
-        
-        return len(timeout_torrents), redownload_failed_torrents
+
+        removed = 0
+        redownload_failed_torrents = []
+        for i, (torrent, active_seconds, remaining_text) in enumerate(timeout_torrents, 1):
+            logger.info(f"{prefix}删除审计 ({i}/{len(timeout_torrents)}): {torrent.name} | HASH={torrent.hash} | "
+                        f"速度={StringUtils.str_filesize(getattr(torrent, 'dlspeed', 0))}/s | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))}")
+            torrent_info = self._snapshot_torrent(torrent)
+            if not self._delete_torrent(downloader_obj, torrent, torrents, prefix):
+                continue
+            removed += 1
+            failed = self._maybe_redownload(
+                torrent_info, f'慢速下载：活跃{active_seconds / 3600:.1f}小时，预计剩余{remaining_text}', prefix)
+            if failed:
+                redownload_failed_torrents.append(failed)
+        return removed, redownload_failed_torrents
+
+    def _has_recognized_history(self, torrent_hash: str) -> bool:
+        """MoviePilot 添加该种子时已识别过媒体信息（下载历史里有 TMDB/豆瓣 ID）"""
+        history = self._get_download_history(torrent_hash)
+        return bool(history and (getattr(history, 'tmdbid', None) or getattr(history, 'doubanid', None)))
+
+    @staticmethod
+    def _get_download_history(torrent_hash: str):
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+            return DownloadHistoryOper().get_by_hash(torrent_hash)
+        except Exception as e:
+            logger.debug(f"【QB种子优化】查询下载历史失败 {torrent_hash}: {e}")
+            return None
 
     def _clean_unrecognized_torrents(self, downloader_obj, torrents, downloader_name):
         """
-        清理下载中识别不到媒体信息的任务
+        清理识别不到媒体信息的下载任务。
+        为避免误删：MoviePilot 下载历史里已有识别记录的跳过；种子元数据未获取（名称仍是hash）的跳过；
+        需要连续两次运行（间隔至少1小时）都识别失败才删除，避免 TMDB 偶发故障导致误删。
         """
-        logger.info(f"【功能6-识别不到媒体信息】开始清理识别不到媒体信息的任务，功能开关: {self._enable_unrecognized_clean}")
-        
+        prefix = "【功能6-识别不到媒体信息】"
         if not self._enable_unrecognized_clean:
-            logger.info("【功能6-识别不到媒体信息】清理识别不到媒体信息功能已禁用，跳过")
+            logger.info(f"{prefix}功能已禁用，跳过")
             return 0
-            
-        logger.info(f"【功能6-识别不到媒体信息】检查条件: 目标状态=downloading/stalledDL/metadl")
-        
-        unrecognized_torrents = []
-        checked_count = 0
+
         media_chain = MediaChain()
-        
+        now = int(time.time())
+        try:
+            seen_before = dict(self.get_data('unrecognized_seen') or {})
+        except Exception:
+            seen_before = {}
+        seen_now = {}
+        unrecognized_torrents = []
+
         for torrent in torrents:
-            checked_count += 1
-            logger.debug(f"【功能6-识别不到媒体信息】检查种子 {checked_count}/{len(torrents)}: {torrent.name}")
-            
-            # 仅处理 downloading、stalledDL 或 metadl 状态
-            state_name = getattr(torrent, 'state', '') or ''
-            state_lower = state_name.lower()
-            is_target_state = state_lower in ('downloading', 'stalleddl', 'metadl')
-            
-            if not is_target_state:
+            state_lower = (getattr(torrent, 'state', '') or '').lower()
+            if state_lower not in ('downloading', 'stalleddl', 'metadl'):
                 continue
-            
-            # 尝试识别媒体信息
+            torrent_name = getattr(torrent, 'name', '') or ''
+            if not torrent_name or torrent_name.lower() == torrent.hash.lower():
+                continue
+            if self._get_exclude_reason(torrent):
+                continue
+            if torrent.hash in self._recognized_cache:
+                continue
+            if self._has_recognized_history(torrent.hash):
+                self._recognized_cache.add(torrent.hash)
+                continue
             try:
-                torrent_name = getattr(torrent, 'name', '')
-                if not torrent_name:
-                    logger.debug(f"【功能6-识别不到媒体信息】种子名称为空，跳过: {torrent.hash}")
-                    continue
-                
-                # 使用 MetaInfo 和 MediaChain 识别媒体信息
-                metainfo = MetaInfo(torrent_name)
-                mediainfo = media_chain.recognize_by_meta(metainfo)
-                
-                if not mediainfo:
-                    logger.info(f"【功能6-识别不到媒体信息】种子识别不到媒体信息: {torrent_name}")
-                    logger.info(f"  - 状态: {state_name}")
-                    logger.info(f"  - HASH: {getattr(torrent, 'hash', 'N/A')}")
-                    logger.info(f"  - 下载进度: {getattr(torrent, 'progress', 0) * 100:.1f}%")
-                    logger.info(f"  - 大小: {StringUtils.str_filesize(getattr(torrent, 'size', 0))}")
-                    unrecognized_torrents.append(torrent)
-                else:
-                    logger.debug(f"【功能6-识别不到媒体信息】种子识别到媒体信息: {torrent_name} -> {mediainfo.title_year}")
-                    
+                mediainfo = media_chain.recognize_by_meta(MetaInfo(torrent_name))
             except Exception as e:
-                logger.warning(f"【功能6-识别不到媒体信息】识别媒体信息异常: {torrent.name}, 错误: {str(e)}")
-                # 识别异常时，保守处理，不删除
+                logger.warning(f"{prefix}识别异常，本次跳过: {torrent_name}, 错误: {e}")
                 continue
-        
-        logger.info(f"【功能6-识别不到媒体信息】检查完成，发现{len(unrecognized_torrents)}个识别不到媒体信息的任务")
-        
-        # 根据配置限制处理数量
+            if mediainfo:
+                self._recognized_cache.add(torrent.hash)
+                continue
+
+            first_seen = seen_before.get(torrent.hash, now)
+            seen_now[torrent.hash] = first_seen
+            if now - first_seen < 3600:
+                logger.info(f"{prefix}首次识别失败，1小时后复查再决定: {torrent_name}")
+                continue
+            logger.info(f"{prefix}连续识别失败超过1小时: {torrent_name} | 进度{getattr(torrent, 'progress', 0) * 100:.1f}%")
+            unrecognized_torrents.append(torrent)
+
+        try:
+            self.save_data('unrecognized_seen', seen_now)
+        except Exception as e:
+            logger.debug(f"{prefix}保存识别记录失败: {e}")
+
+        logger.info(f"{prefix}检查完成，发现{len(unrecognized_torrents)}个识别不到媒体信息的任务")
         if len(unrecognized_torrents) > self._max_unrecognized_process:
-            logger.info(f"【功能6-识别不到媒体信息】种子数量({len(unrecognized_torrents)})超过配置限制({self._max_unrecognized_process})，只处理前{self._max_unrecognized_process}个")
+            logger.info(f"{prefix}超过每次处理上限{self._max_unrecognized_process}，只处理前{self._max_unrecognized_process}个")
             unrecognized_torrents = unrecognized_torrents[:self._max_unrecognized_process]
-        
-        if unrecognized_torrents:
-            logger.info(f"【功能6-识别不到媒体信息】开始删除识别不到媒体信息的任务...")
-            for i, torrent in enumerate(unrecognized_torrents, 1):
-                logger.info(f"【功能6-识别不到媒体信息】删除审计-开始 ({i}/{len(unrecognized_torrents)}): {torrent.name}")
-                logger.info(f"  - HASH: {getattr(torrent, 'hash', 'N/A')}")
-                logger.info(f"  - 状态: {getattr(torrent, 'state', 'unknown')}")
-                logger.info(f"  - 下载进度: {getattr(torrent, 'progress', 0) * 100:.1f}%")
-                logger.info(f"  - 大小: {StringUtils.str_filesize(getattr(torrent, 'size', 0))}")
-                logger.info(f"  - 分类: {getattr(torrent, 'category', 'N/A')}")
-                logger.info(f"  - 标签: {getattr(torrent, 'tags', 'N/A')}")
-                logger.info(f"  - Tracker: {getattr(torrent, 'tracker', 'N/A')}")
-                
-                try:
-                    # 删除种子和文件
-                    torrent_hash = getattr(torrent, 'hash', '')
-                    logger.info(f"【功能6-识别不到媒体信息】准备删除种子和文件: {torrent.name}, HASH: {torrent_hash}")
-                    
-                    # 尝试直接使用 qBittorrent API 删除，确保文件被删除
-                    try:
-                        if hasattr(downloader_obj, 'qbc') and downloader_obj.qbc:
-                            # 直接使用 qBittorrent API 删除，delete_files=True 表示删除文件
-                            downloader_obj.qbc.torrents_delete(delete_files=True, torrent_hashes=torrent_hash)
-                            logger.info(f"【功能6-识别不到媒体信息】通过 qBittorrent API 删除成功: {torrent.name}")
-                            result = True
-                        else:
-                            # 回退到使用封装方法
-                            result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                            logger.info(f"【功能6-识别不到媒体信息】通过封装方法删除: {torrent.name}, 结果: {result}")
-                    except Exception as e:
-                        logger.error(f"【功能6-识别不到媒体信息】删除种子异常: {torrent.name}, 错误: {str(e)}")
-                        # 回退到使用封装方法
-                        result = downloader_obj.delete_torrents(delete_file=True, ids=[torrent.hash])
-                    
-                    if result:
-                        logger.info(f"【功能6-识别不到媒体信息】删除审计-成功: {torrent.name} (HASH={torrent_hash})，已删除种子与数据文件")
-                    else:
-                        logger.error(f"【功能6-识别不到媒体信息】删除审计-失败: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')})")
-                    
-                except Exception as e:
-                    logger.error(f"【功能6-识别不到媒体信息】删除审计-异常: {torrent.name} (HASH={getattr(torrent, 'hash', 'N/A')}), 错误: {str(e)}")
-        
-        return len(unrecognized_torrents)
+
+        removed = 0
+        for i, torrent in enumerate(unrecognized_torrents, 1):
+            logger.info(f"{prefix}删除审计 ({i}/{len(unrecognized_torrents)}): {torrent.name} | HASH={torrent.hash} | "
+                        f"大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | 分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
+            if self._delete_torrent(downloader_obj, torrent, torrents, prefix):
+                removed += 1
+        return removed
 
     def _check_system_status_once(self, qb_client, check_disk_space=True):
         """
@@ -1933,6 +1835,29 @@ class QbOptimizer(_PluginBase):
             return False
 
     def _manage_download_threshold(self, downloader_obj, torrents, downloader_name):
+        if not self._enable_download_threshold:
+            logger.info("【功能5-下载阈值控制】下载阈值控制功能已禁用，跳过")
+            return False
+        try:
+            stored = self.get_data('threshold_paused')
+        except Exception:
+            stored = []
+        if stored is None:
+            # 首次使用暂停记录：旧版本暂停过的种子没有记录，接管当前所有未完成的暂停种子，之后精确跟踪
+            stored = [t.hash for t in torrents
+                      if getattr(t, 'progress', 0) < 1
+                      and any(k in (getattr(t, 'state', '') or '').lower() for k in ('stopped', 'paused'))]
+            logger.info(f"【功能5-下载阈值控制】首次建立暂停记录，接管{len(stored)}个当前暂停的未完成种子")
+        paused_by_plugin = set(stored)
+        try:
+            return self._manage_download_threshold_core(downloader_obj, torrents, downloader_name, paused_by_plugin)
+        finally:
+            try:
+                self.save_data('threshold_paused', list(paused_by_plugin))
+            except Exception as e:
+                logger.debug(f"【功能5-下载阈值控制】保存暂停记录失败: {e}")
+
+    def _manage_download_threshold_core(self, downloader_obj, torrents, downloader_name, paused_by_plugin: set):
         """
         下载阈值控制管理：如果当前下载中的种子总大小超过阈值，直接暂停任务保持不超过阈值
         1. 计算所有下载中种子的总大小（只计算需要下载的文件，优先级不为0）
@@ -1980,9 +1905,12 @@ class QbOptimizer(_PluginBase):
                 logger.error(f"【功能5-下载阈值控制】获取磁盘空间失败: {str(e)}")
                 return False
             
+            # 只恢复本插件暂停过的种子，不动用户手动暂停的种子；已不存在的种子从记录中清除
+            paused_by_plugin.intersection_update({t.hash for t in torrents})
+
             # 筛选下载中的种子和暂停的种子
             downloading_torrents = []  # 正在下载的种子
-            paused_torrents = []      # 暂停的种子（可能是我们暂停的）
+            paused_torrents = []      # 本插件暂停的种子
             
             # 用于调试：统计所有状态
             state_counter = {}
@@ -2008,9 +1936,9 @@ class QbOptimizer(_PluginBase):
                            'stopped' in state_lower or
                            'paused' in state_lower)
                 
-                # 如果已确认为暂停状态，直接加入暂停列表
                 if is_paused:
-                    paused_torrents.append(torrent)
+                    if torrent.hash in paused_by_plugin:
+                        paused_torrents.append(torrent)
                     continue
                 
                 # 检测下载中的种子：优先使用 state_enum（更可靠）
@@ -2042,12 +1970,9 @@ class QbOptimizer(_PluginBase):
                                   state_lower == 'stalledup' or 
                                   state_lower == 'queuedup')
                 
-                # 分类种子
+                # error/missingFiles/checking 等其它状态不处理，避免把异常种子当成暂停种子恢复
                 if is_downloading:
                     downloading_torrents.append(torrent)
-                elif not is_uploading and not is_paused:
-                    # 既不是下载中也不是做种中也不是暂停，且未完成，视为其他暂停状态
-                    paused_torrents.append(torrent)
             
             # 输出状态统计用于调试
             logger.info(f"【功能5-下载阈值控制】种子状态统计: {dict(sorted(state_counter.items(), key=lambda x: x[1], reverse=True)[:10])}")
@@ -2178,6 +2103,7 @@ class QbOptimizer(_PluginBase):
                         
                         if result:
                             logger.info(f"【功能5-下载阈值控制】暂停种子成功: {torrent_name} (速度: {dlspeed_mbps:.2f}MB/s, 进度: {progress_percent:.1f}%, 剩余: {StringUtils.str_filesize(remaining_size)})")
+                            paused_by_plugin.add(torrent_hash)
                             paused_count += 1
                             paused_size += remaining_size
                         else:
@@ -2311,6 +2237,7 @@ class QbOptimizer(_PluginBase):
                         
                         if result:
                             logger.info(f"【功能5-下载阈值控制】恢复种子成功: {torrent_name} (速度: {dlspeed_mbps:.2f}MB/s, 剩余: {StringUtils.str_filesize(remaining_size)})")
+                            paused_by_plugin.discard(torrent_hash)
                             resumed_count += 1
                             resumed_size += remaining_size
                             # 更新当前预计剩余空间（恢复后，这个种子会变成下载中的）
@@ -2350,375 +2277,201 @@ class QbOptimizer(_PluginBase):
             logger.error(f"【功能5-下载阈值控制】异常详情: {traceback.format_exc()}")
             return False
 
-    def _re_download_torrent(self, torrent_info):
+    def _re_download_torrent(self, torrent_info) -> Tuple[bool, str]:
         """
-        重新下载种子
+        重新下载：优先用 MoviePilot 下载历史里的 TMDB ID 精确识别，其次按种子名识别，
+        识别成功后按媒体信息搜索（结果已按片名/年份匹配），识别失败才退回到按标题关键词搜索。
+        候选需满足季集一致、大小相近、做种数达标，并限制同一资源的重试次数，避免反复删了又下。
         """
+        prefix = "【重新下载】"
+        name = torrent_info['name']
+        meta = MetaInfo(name)
+        attempt_key = self._redownload_key(meta, name)
+        history = self._load_redownload_history()
+        attempts = history.get(attempt_key, {}).get('count', 0)
+        if attempts >= self._redownload_max_attempts:
+            logger.warning(f"{prefix}{attempt_key} 已自动重新下载{attempts}次，不再重试: {name}")
+            return False, f"已自动重新下载{attempts}次，停止重试"
+
+        mediainfo = self._recognize_for_redownload(torrent_info['hash'], meta)
+        candidates = self._search_candidates(meta, mediainfo, name)
+        if not candidates:
+            return False, "未搜索到候选资源"
+
+        best, reason = self._select_best_torrent(candidates, torrent_info, meta)
+        if not best:
+            logger.warning(f"{prefix}没有合适的替代资源（{reason}）: {name}")
+            return False, reason
+
+        if not self._download_torrent(best, torrent_info, mediainfo):
+            return False, "提交下载失败（可能下载器中已存在）"
+
+        history[attempt_key] = {'count': attempts + 1, 'ts': int(time.time()), 'title': best.torrent_info.title}
+        self._save_redownload_history(history)
+        return True, ""
+
+    @staticmethod
+    def _redownload_key(meta, name: str) -> str:
+        title = getattr(meta, 'name', None) or name
+        year = getattr(meta, 'year', None) or ''
+        season_episode = (getattr(meta, 'season_episode', '') or '').replace(' ', '')
+        return f"{title}|{year}|{season_episode}"
+
+    def _load_redownload_history(self) -> dict:
         try:
-            logger.info(f"【重新下载】准备重新下载: {torrent_info['name']}")
-            
-            # 提取种子名称，去除文件扩展名
-            torrent_name = torrent_info['name']
-            search_keyword = self._extract_search_keyword(torrent_name)
-            
-            # 记录重新下载信息
-            logger.info(f"【重新下载】重新下载信息:")
-            logger.info(f"  - 种子名称: {torrent_name}")
-            logger.info(f"  - 搜索关键词: {search_keyword}")
-            logger.info(f"  - 原始种子: {torrent_info['name']}")
-            logger.info(f"  - 种子大小: {StringUtils.str_filesize(torrent_info['size'])}")
-            logger.info(f"  - 分类: {torrent_info.get('category', 'N/A')}")
-            logger.info(f"  - 标签: {torrent_info.get('tags', 'N/A')}")
-            logger.info(f"  - Tracker: {torrent_info.get('tracker', 'N/A')}")
-            logger.info(f"  - 保存路径: {torrent_info.get('save_path', 'N/A')}")
-            
-            # 输出搜索站点信息
+            history = dict(self.get_data('redownload_history') or {})
+        except Exception:
+            return {}
+        expire = int(time.time()) - 30 * 24 * 3600
+        return {k: v for k, v in history.items() if v.get('ts', 0) >= expire}
+
+    def _save_redownload_history(self, history: dict):
+        try:
+            self.save_data('redownload_history', history)
+        except Exception as e:
+            logger.debug(f"【重新下载】保存重试记录失败: {e}")
+
+    def _recognize_for_redownload(self, torrent_hash: str, meta) -> Optional[MediaInfo]:
+        prefix = "【重新下载】"
+        media_chain = MediaChain()
+        history = self._get_download_history(torrent_hash)
+        if history and getattr(history, 'tmdbid', None):
             try:
-                if self._search_sites:
-                    from app.db.site_oper import SiteOper as _SiteOper
-                    site_map = {site.id: site.name for site in _SiteOper().list_order_by_pri()}
-                    pretty_sites = [f"{site_map.get(sid, sid)}({sid})" for sid in self._search_sites]
-                    logger.info(f"【重新下载】将使用以下站点进行搜索: {pretty_sites}")
-                else:
-                    logger.info(f"【重新下载】未指定站点，使用全站搜索")
-            except Exception:
-                pass
-
-            # 搜索新的种子
-            search_results = self._search_torrents(search_keyword)
-            if not search_results:
-                logger.warning(f"【重新下载】未找到替代种子: {search_keyword}")
-                return False
-                
-            # 选择最佳种子（做种数最多的）
-            best_torrent = self._select_best_torrent(search_results, torrent_info)
-            if not best_torrent:
-                logger.warning(f"【重新下载】未找到合适的替代种子: {search_keyword}")
-                return False
-                
-            # 下载选中的种子
-            return self._download_torrent(best_torrent, torrent_info)
-            
-        except Exception as e:
-            logger.error(f"【重新下载】重新下载种子失败: {torrent_info.get('name', 'Unknown')}, 错误: {str(e)}")
-            import traceback
-            logger.error(f"【重新下载】重新下载异常详情: {traceback.format_exc()}")
-            return False
-
-    def _extract_search_keyword(self, torrent_name):
-        """
-        从种子名称中提取搜索关键词
-        """
+                mtype = MediaType(history.type) if getattr(history, 'type', None) else None
+                mediainfo = media_chain.recognize_media(mtype=mtype, tmdbid=history.tmdbid)
+                if mediainfo:
+                    logger.info(f"{prefix}按下载历史TMDB ID识别: {mediainfo.title_year}")
+                    return mediainfo
+            except Exception as e:
+                logger.warning(f"{prefix}按下载历史识别失败: {e}")
         try:
-            # 去除常见的文件扩展名
-            if '.' in torrent_name:
-                name_parts = torrent_name.split('.')
-                # 保留主要部分，去除质量、编码等信息
-                if len(name_parts) > 2:
-                    torrent_name = '.'.join(name_parts[:-2])
-            
-            # 去除常见的发布组标识和质量信息
-            remove_patterns = [
-                r'\b(1080p|720p|480p|2160p|4K|UHD)\b',
-                r'\b(BluRay|BDRip|DVDRip|WEBRip|HDTV)\b',
-                r'\b(x264|x265|H\.264|H\.265|HEVC)\b',
-                r'\b(AAC|AC3|DTS|FLAC)\b',
-                r'\[.*?\]',  # 方括号内容
-                r'\(.*?\)',  # 圆括号内容
-                r'-\w+$',    # 末尾的发布组
-            ]
-            
-            import re
-            for pattern in remove_patterns:
-                torrent_name = re.sub(pattern, '', torrent_name, flags=re.IGNORECASE)
-            
-            # 清理多余的空格和特殊字符
-            torrent_name = re.sub(r'[.\-_]+', ' ', torrent_name)
-            torrent_name = ' '.join(torrent_name.split())
-            
-            logger.info(f"【QB种子优化】提取搜索关键词: {torrent_name}")
-            return torrent_name.strip()
-            
+            mediainfo = media_chain.recognize_by_meta(meta)
+            if mediainfo:
+                logger.info(f"{prefix}按种子名识别: {mediainfo.title_year}")
+            return mediainfo
         except Exception as e:
-            logger.error(f"【QB种子优化】提取搜索关键词失败: {str(e)}")
-            return torrent_name
-
-    def _search_torrents(self, keyword):
-        """
-        搜索种子
-        """
-        try:
-            logger.info(f"【重新下载】开始搜索种子: {keyword}")
-            
-            # 使用SearchChain搜索种子
-            search_chain = SearchChain()
-            search_results = []
-            
-            # 搜索多页结果，获取更多候选种子（一次性传入站点列表，使用SearchChain并发能力）
-            for page in range(3):  # 搜索前3页
-                try:
-                    if self._search_sites:
-                        # 指定站点并发搜索
-                        page_results = search_chain.search_by_title(title=keyword, page=page, sites=self._search_sites)
-                        added = len(page_results) if page_results else 0
-                        if added:
-                            search_results.extend(page_results)
-                        logger.info(f"【重新下载】第{page + 1}页合计新增{added}个候选（指定站点）")
-                    else:
-                        # 全站并发搜索
-                        page_results = search_chain.search_by_title(title=keyword, page=page)
-                        added = len(page_results) if page_results else 0
-                        if added:
-                            search_results.extend(page_results)
-                        logger.info(f"【重新下载】第{page + 1}页新增{added}个候选（全站）")
-                    # 如该页没有新增，尝试下一页；连续空页则提前结束
-                    if not page_results:
-                        logger.info(f"【重新下载】第{page + 1}页无结果，提前结束翻页")
-                        break
-                except Exception as e:
-                    logger.error(f"【重新下载】第{page + 1}页搜索失败: {str(e)}")
-                    continue
-            
-            logger.info(f"【重新下载】总共搜索到{len(search_results)}个候选种子")
-
-            # 展示候选Top10（按做种数降序）
-            try:
-                def _safe_int(x):
-                    try:
-                        return int(x)
-                    except Exception:
-                        return 0
-                
-                # 使用综合评分算法排序候选种子
-                scored_candidates = []
-                for r in search_results:
-                    ti = getattr(r, 'torrent_info', None)
-                    if not ti:
-                        continue
-                    
-                    seeders = _safe_int(getattr(ti, 'seeders', 0))
-                    dlspeed = 0  # 搜索结果中的种子还未下载，速度为0
-                    speed_score = (dlspeed / (1024 * 1024)) * self._speed_weight
-                    seeder_score = seeders * self._seeder_weight
-                    total_score = speed_score + seeder_score
-                    
-                    scored_candidates.append((
-                        total_score,
-                        seeders,
-                        StringUtils.str_filesize(getattr(ti, 'size', 0) or 0),
-                        getattr(ti, 'site_name', '未知站点'),
-                        getattr(ti, 'title', '未知标题')
-                    ))
-                
-                scored_candidates.sort(key=lambda x: x[0], reverse=True)
-                logger.info("【重新下载】候选Top10（按综合评分）:")
-                for idx, (score, seeders, size_str, site_name, title) in enumerate(scored_candidates[:10], 1):
-                    logger.info(f"  {idx:2d}. 综合评分: {score:6.2f} | 做种: {seeders:4d} | 大小: {size_str:>8} | 站点: {site_name} | 标题: {title}")
-            except Exception:
-                pass
-            return search_results
-            
-        except Exception as e:
-            logger.error(f"【重新下载】搜索种子失败: {str(e)}")
-            return []
-
-    def _select_best_torrent(self, search_results, original_torrent_info):
-        """
-        从搜索结果中选择最佳种子（使用综合评分算法）
-        """
-        try:
-            if not search_results:
-                return None
-                
-            logger.info(f"【重新下载】从{len(search_results)}个种子中选择最佳种子（使用综合评分算法）")
-            logger.info(f"【重新下载】综合评分算法: 评分 = 下载速度(MB/s) × {self._speed_weight} + 做种数 × {self._seeder_weight}")
-            logger.info(f"【重新下载】最低综合评分阈值: {self._min_score_threshold}")
-            
-            # 使用综合评分算法选择最佳种子
-            scored_torrents = []
-            original_size = original_torrent_info.get('size', 0)
-            
-            for result in search_results:
-                torrent_info = result.torrent_info
-                if not torrent_info:
-                    continue
-                    
-                # 获取种子信息
-                seeders = getattr(torrent_info, 'seeders', 0) or 0
-                torrent_size = getattr(torrent_info, 'size', 0) or 0
-                
-                # 计算综合评分（与优先级优化使用相同的算法）
-                # 注意：搜索结果的种子还没有下载，所以下载速度为0，主要依赖做种数
-                dlspeed = 0  # 搜索结果中的种子还未下载，速度为0
-                speed_score = (dlspeed / (1024 * 1024)) * self._speed_weight  # 转换为MB/s并应用权重
-                seeder_score = seeders * self._seeder_weight  # 做种数权重
-                
-                final_score = speed_score + seeder_score
-                
-                # 避免0做种数的种子
-                if seeders == 0:
-                    final_score = 0
-                
-                scored_torrents.append({
-                    'result': result,
-                    'torrent_info': torrent_info,
-                    'score': final_score,
-                    'speed_score': speed_score,
-                    'seeder_score': seeder_score,
-                    'seeders': seeders,
-                    'size': torrent_size
-                })
-                
-                logger.debug(f"【重新下载】种子评分: {torrent_info.title}")
-                logger.debug(f"  - 做种数: {seeders}, 大小: {StringUtils.str_filesize(torrent_size)}")
-                logger.debug(f"  - 速度评分: {speed_score:.2f}, 做种评分: {seeder_score:.2f}")
-                logger.debug(f"  - 综合评分: {final_score:.2f}")
-            
-            # 过滤出符合最低综合评分阈值的种子
-            qualified_torrents = [t for t in scored_torrents if t['score'] >= self._min_score_threshold]
-            
-            logger.info(f"【重新下载】评分统计: 总候选{len(scored_torrents)}个, 符合阈值(≥{self._min_score_threshold}){len(qualified_torrents)}个")
-            
-            # 按评分排序，选择最佳种子
-            if qualified_torrents:
-                # 输出评分Top5
-                try:
-                    preview = sorted(qualified_torrents, key=lambda x: x['score'], reverse=True)[:5]
-                    logger.info("【重新下载】符合阈值的综合评分Top5 候选：")
-                    for idx, item in enumerate(preview, 1):
-                        logger.info(
-                            f"  {idx}. 综合评分:{item['score']:.2f} (速度:{item['speed_score']:.2f} + 做种:{item['seeder_score']:.2f})"
-                        )
-                        logger.info(
-                            f"     做种:{item['seeders']} | 大小:{StringUtils.str_filesize(item['size'])} | 标题:{item['torrent_info'].title}"
-                        )
-                except Exception:
-                    pass
-
-                best = max(qualified_torrents, key=lambda x: x['score'])
-                logger.info(f"【重新下载】选择最佳种子: {best['torrent_info'].title}")
-                logger.info(f"  - 做种数: {best['seeders']}")
-                logger.info(f"  - 大小: {StringUtils.str_filesize(best['size'])}")
-                logger.info(f"  - 综合评分: {best['score']:.2f} (速度:{best['speed_score']:.2f} + 做种:{best['seeder_score']:.2f})")
-                logger.info(f"  - 评分阈值检查: {best['score']:.2f} ≥ {self._min_score_threshold} ✓")
-                try:
-                    logger.info(f"  - 站点: {getattr(best['torrent_info'], 'site_name', '未知')}")
-                except Exception:
-                    pass
-                return best['result']
-            else:
-                # 没有符合阈值的种子，输出不符合的候选信息
-                logger.warning(f"【重新下载】没有种子符合最低综合评分阈值 {self._min_score_threshold}")
-                if scored_torrents:
-                    logger.info("【重新下载】不符合阈值的候选Top3：")
-                    preview = sorted(scored_torrents, key=lambda x: x['score'], reverse=True)[:3]
-                    for idx, item in enumerate(preview, 1):
-                        logger.info(
-                            f"  {idx}. 综合评分:{item['score']:.2f} < {self._min_score_threshold} ✗ | 做种:{item['seeders']} | 标题:{item['torrent_info'].title}"
-                        )
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"【重新下载】选择最佳种子失败: {str(e)}")
+            logger.warning(f"{prefix}按种子名识别失败: {e}")
             return None
 
-    def _download_torrent(self, search_result, original_torrent_info):
+    def _search_candidates(self, meta, mediainfo: Optional[MediaInfo], name: str) -> list:
+        prefix = "【重新下载】"
+        search_chain = SearchChain()
+        sites = self._search_sites or None
+        if mediainfo:
+            try:
+                results = search_chain.process(mediainfo=mediainfo, sites=sites) or []
+                logger.info(f"{prefix}按媒体信息搜索 {mediainfo.title_year}，得到{len(results)}个候选")
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"{prefix}按媒体信息搜索失败，改用标题搜索: {e}")
+
+        keyword = self._extract_search_keyword(name, meta)
+        results = []
+        for page in range(3):
+            try:
+                page_results = search_chain.search_by_title(title=keyword, page=page, sites=sites) or []
+            except Exception as e:
+                logger.error(f"{prefix}第{page + 1}页搜索失败: {e}")
+                break
+            results.extend(page_results)
+            if not page_results:
+                break
+        logger.info(f"{prefix}按标题「{keyword}」搜索，得到{len(results)}个候选")
+        return results
+
+    @staticmethod
+    def _extract_search_keyword(torrent_name: str, meta=None) -> str:
+        """用 MoviePilot 的元数据解析取片名，避免把剧集标题、来源、编码等带进搜索词"""
+        meta = meta or MetaInfo(torrent_name)
+        keyword = (getattr(meta, 'cn_name', None) or getattr(meta, 'en_name', None)
+                   or getattr(meta, 'name', None) or '').strip()
+        return keyword or torrent_name
+
+    def _select_best_torrent(self, search_results, original_torrent_info, original_meta) -> Tuple[Optional[Context], str]:
         """
-        下载选中的种子
+        过滤：做种数达标、季集与原种子一致、大小在允许偏差内；
+        排序：做种数优先，其次大小与原种子越接近越好。
         """
+        prefix = "【重新下载】"
+        min_seeders = max(self._redownload_min_seeders, self._zero_seed_threshold + 1)
+        original_size = original_torrent_info.get('size', 0) or 0
+        orig_seasons = set(getattr(original_meta, 'season_list', None) or [])
+        orig_episodes = set(getattr(original_meta, 'episode_list', None) or [])
+        tolerance = self._redownload_size_tolerance / 100 if self._redownload_size_tolerance > 0 else None
+
+        stats = {'seeders': 0, 'season': 0, 'size': 0}
+        qualified = []
+        for result in search_results:
+            ti = getattr(result, 'torrent_info', None)
+            if not ti:
+                continue
+            seeders = self._to_int(getattr(ti, 'seeders', 0), 0)
+            size = getattr(ti, 'size', 0) or 0
+            if seeders < min_seeders:
+                stats['seeders'] += 1
+                continue
+            cand_meta = getattr(result, 'meta_info', None) or MetaInfo(ti.title, getattr(ti, 'description', None))
+            cand_seasons = set(getattr(cand_meta, 'season_list', None) or [])
+            cand_episodes = set(getattr(cand_meta, 'episode_list', None) or [])
+            if (orig_seasons or orig_episodes) and (cand_seasons != orig_seasons or cand_episodes != orig_episodes):
+                stats['season'] += 1
+                continue
+            if tolerance is not None and original_size > 0 and abs(size - original_size) / original_size > tolerance:
+                stats['size'] += 1
+                continue
+            qualified.append((seeders, abs(size - original_size), result))
+
+        summary = (f"候选{len(search_results)}个：做种<{min_seeders} {stats['seeders']}个，"
+                   f"季集不一致 {stats['season']}个，大小偏差>{self._redownload_size_tolerance}% {stats['size']}个")
+        logger.info(f"{prefix}{summary}，符合条件{len(qualified)}个")
+        if not qualified:
+            return None, summary
+
+        qualified.sort(key=lambda x: (-x[0], x[1]))
+        for idx, (seeders, _, result) in enumerate(qualified[:5], 1):
+            ti = result.torrent_info
+            logger.info(f"{prefix}  {idx}. 做种{seeders} | {StringUtils.str_filesize(ti.size)} | {getattr(ti, 'site_name', '')} | {ti.title}")
+        best = qualified[0][2]
+        logger.info(f"{prefix}选择: {best.torrent_info.title}")
+        return best, ""
+
+    def _download_torrent(self, search_result, original_torrent_info, mediainfo: Optional[MediaInfo] = None) -> bool:
+        prefix = "【重新下载】"
         try:
             torrent_info = search_result.torrent_info
-            meta_info = search_result.meta_info
-            media_info = search_result.media_info
-            
-            logger.info(f"【重新下载】开始下载种子: {torrent_info.title}")
-            logger.info(f"  - 站点: {torrent_info.site_name}")
-            logger.info(f"  - 大小: {StringUtils.str_filesize(torrent_info.size)}")
-            logger.info(f"  - 做种数: {torrent_info.seeders}")
-            
-            # 如果没有识别到媒体信息，创建基础媒体信息
+            meta_info = search_result.meta_info or MetaInfo(torrent_info.title, getattr(torrent_info, 'description', None))
+            media_info = search_result.media_info or mediainfo
             if not media_info:
                 media_info = MediaInfo()
-                media_info.category = original_torrent_info.get('category', '其它')
+                media_info.category = original_torrent_info.get('category') or '其它'
                 media_info.type = MediaType.UNKNOWN
                 media_info.title = meta_info.title if meta_info else torrent_info.title
-                logger.info(f"【重新下载】未识别到媒体信息，使用默认配置")
-            
-            # 创建上下文
-            context = Context(
-                meta_info=meta_info,
-                media_info=media_info,
-                torrent_info=torrent_info
-            )
-            
+                logger.info(f"{prefix}未识别到媒体信息，使用默认配置")
+
+            context = Context(meta_info=meta_info, media_info=media_info, torrent_info=torrent_info)
             # 标记绕过下载器负载均衡，避免与负载均衡插件冲突
             setattr(context, "_bypass_downloader_balancer", True)
-            
-            # 获取下载目录（使用原始种子的保存路径）
-            save_path = original_torrent_info.get('save_path', '')
-            if save_path:
-                logger.info(f"【重新下载】使用原始种子的下载目录: {save_path}")
-            else:
-                logger.info(f"【重新下载】未找到原始下载目录，使用默认路径")
-            
-            # 使用DownloadChain下载
-            download_chain = DownloadChain()
-            download_id = download_chain.download_single(
-                context=context,
-                username='admin',  # 使用默认用户
-                save_path=save_path if save_path else None  # 使用原始种子的下载路径
-            )
-            
-            if download_id:
-                logger.info(f"【重新下载】种子下载成功: {torrent_info.title}, 下载ID: {download_id}")
-                return True
-            else:
-                logger.error(f"【重新下载】种子下载失败: {torrent_info.title}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"【重新下载】下载种子异常: {str(e)}")
-            import traceback
-            logger.error(f"【重新下载】下载异常详情: {traceback.format_exc()}")
-            return False
 
-    def _is_important_torrent(self, torrent):
-        """
-        判断是否为重要种子（避免误删）
-        """
-        try:
-            logger.debug(f"【QB种子优化】检查种子重要性: {torrent.name}")
-            
-            # 检查种子标签
-            if hasattr(torrent, 'tags') and torrent.tags:
-                important_tags = ['important', 'keep', 'preserve', 'moviepilot']
-                logger.debug(f"【QB种子优化】种子标签: {torrent.tags}")
-                for tag in important_tags:
-                    if tag.lower() in torrent.tags.lower():
-                        logger.info(f"【QB种子优化】种子包含重要标签 '{tag}': {torrent.name}")
-                        return True
-            
-            # 检查种子名称关键词
-            important_keywords = ['moviepilot', 'important', 'keep']
-            torrent_name_lower = torrent.name.lower()
-            logger.debug(f"【QB种子优化】种子名称: {torrent.name}")
-            for keyword in important_keywords:
-                if keyword in torrent_name_lower:
-                    logger.info(f"【QB种子优化】种子名称包含重要关键词 '{keyword}': {torrent.name}")
-                    return True
-            
-            # 检查分享率（高分享率的种子可能是重要的）
-            if hasattr(torrent, 'ratio') and torrent.ratio > 10:
-                logger.info(f"【QB种子优化】种子分享率较高 ({torrent.ratio}): {torrent.name}")
+            save_path = original_torrent_info.get('save_path') or None
+            logger.info(f"{prefix}提交下载: {torrent_info.title} | 站点={torrent_info.site_name} | "
+                        f"下载器={self._current_downloader} | 目录={save_path or '默认'}")
+            download_id = DownloadChain().download_single(
+                context=context,
+                downloader=self._current_downloader,
+                save_path=save_path,
+                username=self.plugin_name,
+            )
+            if download_id:
+                logger.info(f"{prefix}下载成功: {torrent_info.title}, 下载ID: {download_id}")
                 return True
-            
-            logger.debug(f"【QB种子优化】种子不是重要种子: {torrent.name}")
+            logger.error(f"{prefix}下载失败: {torrent_info.title}")
             return False
-            
         except Exception as e:
-            logger.warning(f"【QB种子优化】检查种子重要性时出错: {str(e)}")
-            return False  # 出错时保守处理，不删除
+            logger.error(f"{prefix}下载异常: {e}")
+            import traceback
+            logger.error(f"{prefix}异常详情: {traceback.format_exc()}")
+            return False
 
     def show_status(self):
         """
@@ -2746,7 +2499,7 @@ class QbOptimizer(_PluginBase):
                 # 统计各种状态的种子
                 downloading = [t for t in all_torrents if t.state_enum.is_downloading]
                 uploading = [t for t in all_torrents if t.state_enum.is_uploading]
-                zero_seed = [t for t in uploading if t.num_seeds <= self._zero_seed_threshold]
+                zero_seed = [t for t in downloading if self._get_seeder_count(t) <= self._zero_seed_threshold]
                 # high_seed = [t for t in downloading if t.num_seeds >= 10]  # 已改为综合评分判断
                 
                 # 详细统计
@@ -2761,7 +2514,7 @@ class QbOptimizer(_PluginBase):
                 if zero_seed:
                     logger.info(f"【QB种子优化】做种数为0的种子详情:")
                     for i, torrent in enumerate(zero_seed[:5], 1):  # 只显示前5个
-                        logger.info(f"  {i}. {torrent.name} (做种数: {torrent.num_seeds}, 分享率: {torrent.ratio})")
+                        logger.info(f"  {i}. {torrent.name} (做种数: {self._get_seeder_count(torrent)}, 进度: {torrent.progress * 100:.1f}%)")
                     if len(zero_seed) > 5:
                         logger.info(f"  ... 还有 {len(zero_seed) - 5} 个")
                 
@@ -2777,7 +2530,7 @@ class QbOptimizer(_PluginBase):
                 status_msg += f"总种子数: {len(all_torrents)}\n"
                 status_msg += f"下载中: {len(downloading)}\n"
                 status_msg += f"做种中: {len(uploading)}\n"
-                status_msg += f"做种数为0: {len(zero_seed)}\n"
+                status_msg += f"下载中显示无人做种（未复核）: {len(zero_seed)}\n"
                 # status_msg += f"高做种数: 已改为综合评分判断\n"
                 
                 logger.info(f"【QB种子优化】状态消息: {status_msg}")
@@ -2921,7 +2674,82 @@ class QbOptimizer(_PluginBase):
                             }
                         ]
                     },
-                    
+
+                    # 过滤设置
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'secondary',
+                                            'variant': 'tonal',
+                                            'title': '🔍 过滤设置',
+                                            'text': '设置排除条件，避免误删重要文件（对无人做种、慢速下载、识别不到媒体信息三项清理生效）'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_keywords',
+                                            'label': '🔤 排除关键字',
+                                            'rows': 3,
+                                            'placeholder': '种子名称包含这些关键字将被跳过（不区分大小写）\n每行一个关键字',
+                                            'prepend-inner-icon': 'mdi-text-search'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_categories',
+                                            'label': '📂 排除分类',
+                                            'rows': 3,
+                                            'placeholder': '这些分类的种子将被跳过\n每行一个分类名',
+                                            'prepend-inner-icon': 'mdi-folder-outline'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_labels',
+                                            'label': '🏷️ 排除标签',
+                                            'rows': 3,
+                                            'placeholder': '这些标签的种子将被跳过\n每行一个标签名',
+                                            'prepend-inner-icon': 'mdi-tag-outline'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+
                     # 无人做种任务配置组
                     {
                         'component': 'VRow',
@@ -2999,6 +2827,43 @@ class QbOptimizer(_PluginBase):
                             }
                         ]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'seed_check_grace_minutes',
+                                            'label': '活跃满N分钟后才判定（分钟）',
+                                            'placeholder': '30',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': 'qB 列表中的做种数在 tracker 返回数据前会显示为 0（刚添加、刚恢复、排队中的种子都是如此）。'
+                                                    '插件会再核对：实际活跃时长、当前下载速度、已连接做种者、可用分布以及 tracker 返回的做种数，'
+                                                    'tracker 未返回数据的种子会触发重新汇报，下次运行再判断。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     
                     # 慢速下载任务配置组
                     {
@@ -3050,7 +2915,7 @@ class QbOptimizer(_PluginBase):
                                         'component': 'VTextField',
                                         'props': {
                                             'model': 'timeout_hours',
-                                            'label': '预计时长&&已下载时长超出（小时）',
+                                            'label': '实际活跃&&预计剩余时长超出（小时）',
                                             'placeholder': '24',
                                             'type': 'number'
                                         }
@@ -3210,6 +3075,42 @@ class QbOptimizer(_PluginBase):
                                             'label': '每次处理数量',
                                             'placeholder': '100',
                                             'type': 'number'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'probe_wait_seconds',
+                                            'label': '排队种子探测最长等待（秒）',
+                                            'placeholder': '30',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '排队中的种子不会向 tracker 汇报，拿不到做种数。插件会临时强制启动一小批、主动重新汇报，'
+                                                    '拿到 tracker 数据后立即取消强制启动；结果缓存6小时，避免重复探测。'
                                         }
                                     }
                                 ]
@@ -3547,6 +3448,77 @@ class QbOptimizer(_PluginBase):
                             }
                         ]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'redownload_min_seeders',
+                                            'label': '替代资源最少做种数',
+                                            'placeholder': '3',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'redownload_size_tolerance',
+                                            'label': '大小允许偏差（%，0为不限制）',
+                                            'placeholder': '50',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'redownload_max_attempts',
+                                            'label': '同一资源最多重新下载次数',
+                                            'placeholder': '3',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '重新下载优先用 MoviePilot 下载历史中的 TMDB ID 识别，按媒体信息精确搜索，识别失败才按片名搜索；'
+                                                    '候选资源需季集一致、大小相近、做种数达标，按做种数从高到低选择，下载到原下载器和原目录。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     
 
 
@@ -3656,6 +3628,16 @@ class QbOptimizer(_PluginBase):
             # 下载阈值控制配置
             "enable_download_threshold": False,
             "min_disk_space_threshold": 50,
+            # 过滤设置
+            "exclude_keywords": "",
+            "exclude_categories": "",
+            "exclude_labels": "",
+            # 做种数据复核与重新下载
+            "seed_check_grace_minutes": 30,
+            "probe_wait_seconds": 30,
+            "redownload_min_seeders": 3,
+            "redownload_size_tolerance": 50,
+            "redownload_max_attempts": 3,
         }
 
     def get_page(self) -> List[dict]:
