@@ -36,7 +36,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -941,7 +941,15 @@ class QbOptimizerPlus(_PluginBase):
             logger.info("【QB种子优化】未匹配到高做种种子，采样前10条做种信息：")
             for t in sample:
                 logger.info(f"  - {getattr(t, 'name', '')} | state={getattr(t, 'state','')} | seeds={self._get_seeder_count(t)} | raw=[num_seeds={getattr(t,'num_seeds',None)}, seeds={getattr(t,'seeds',None)}, seeders={getattr(t,'seeders',None)}, connected_seeds={getattr(t,'connected_seeds',None)}, num_complete={getattr(t,'num_complete',None)}]")
-        
+
+        # 命中过滤设置的种子（如keep标签）最后置顶，保证排在队列最前
+        keep_torrents = [t for t in torrents
+                         if getattr(t, 'progress', 0) < 1 and not self._is_paused_state(t) and self._get_exclude_reason(t)]
+        for torrent in keep_torrents:
+            self._set_qb_torrent_priority(downloader_obj, torrent.hash, 1)
+        if keep_torrents:
+            logger.info(f"【功能3-综合评分】{len(keep_torrents)}个保持下载的种子已置顶")
+
         return len(high_seed_torrents)
 
     def _process_queued_torrents(self, downloader_obj, queued_torrents, high_seed_torrents):
@@ -1006,6 +1014,8 @@ class QbOptimizerPlus(_PluginBase):
                 'dlspeed': dlspeed,
                 'progress': getattr(torrent, 'progress', 0) * 100
             })
+        elif self._get_exclude_reason(torrent):
+            logger.info(f"{prefix}[{source}] 做种{seeders}，评分{score:.2f}偏低，但命中过滤设置，保持队列位置: {torrent.name}")
         else:
             logger.info(f"{prefix}[{source}] 做种{seeders}，评分{score:.2f}低于{self._min_score_threshold}，移到队尾: {torrent.name}")
             self._set_qb_torrent_priority(downloader_obj, torrent.hash, 999)
@@ -1902,6 +1912,14 @@ class QbOptimizerPlus(_PluginBase):
         state_lower = (getattr(torrent, 'state', '') or '').lower()
         return any(k in state_lower for k in ('stopped', 'paused'))
 
+    @staticmethod
+    def _qb_preallocate_enabled(downloader_obj) -> bool:
+        try:
+            return bool((downloader_obj.qbc.app_preferences() or {}).get('preallocate_all'))
+        except Exception as e:
+            logger.debug(f"【功能5-下载阈值控制】读取qB预分配设置失败: {e}")
+            return False
+
     def _remaining_download_bytes(self, downloader_obj, torrent) -> Optional[float]:
         """只统计需要下载（优先级不为0）且未完成的文件"""
         try:
@@ -1965,6 +1983,7 @@ class QbOptimizerPlus(_PluginBase):
             logger.warning(f"{prefix}未获取到磁盘剩余空间，跳过")
             return False
         budget_bytes = free_bytes - self._min_disk_space_threshold * 1024 ** 3
+        preallocate = self._qb_preallocate_enabled(downloader_obj)
 
         running, paused = [], []
         for torrent in torrents:
@@ -2003,15 +2022,19 @@ class QbOptimizerPlus(_PluginBase):
             value = speed + record['credit'] + 0.001 * min(self._get_seeder_count(torrent), 100) + 0.0001
             if is_running:
                 value *= self.RUNNING_BONUS
-            if remaining > max(budget_bytes, 0):
+            # qB 开启预分配时，启动过的种子已经占好了磁盘空间，继续下载不再消耗剩余空间
+            weight = 0.0 if preallocate and self._first_int_attr(torrent, ['time_active']) > 0 else remaining
+            keep_reason = self._get_exclude_reason(torrent)
+            if weight > max(budget_bytes, 0):
                 oversize.append((torrent, remaining))
-            items.append((torrent.hash, remaining, value))
-            info[torrent.hash] = (torrent, remaining, speed, is_running)
+            items.append((torrent.hash, weight, value))
+            info[torrent.hash] = (torrent, remaining, speed, is_running, weight, keep_reason)
 
-        total_running = sum(info[h][1] for h in info if info[h][3])
+        total_running = sum(info[h][4] for h in info if info[h][3])
         logger.info(f"{prefix}剩余空间 {StringUtils.str_filesize(free_bytes)}，最小阈值 {self._min_disk_space_threshold}GB，"
                     f"可用预算 {StringUtils.str_filesize(max(budget_bytes, 0))}；下载中{len(running)}个"
-                    f"（还需{StringUtils.str_filesize(total_running)}），插件暂停{len(paused)}个")
+                    f"（还需{StringUtils.str_filesize(total_running)}），插件暂停{len(paused)}个"
+                    f"{'，qB已开启预分配（已启动过的种子不再计入）' if preallocate else ''}")
         new_oversize = [(t, r) for t, r in oversize if t.hash not in oversize_notified]
         for torrent, remaining in oversize:
             logger.warning(f"{prefix}剩余{StringUtils.str_filesize(remaining)}超过可用预算，当前空间下无法下载完成: {torrent.name}")
@@ -2030,17 +2053,26 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"{prefix}下载中种子总需求在预算内，无需调整")
             return False
 
-        chosen = self._knapsack_select(items, budget_bytes)
+        # 必定保持下载：命中过滤设置的种子（如keep标签），以及不再占用剩余空间的种子；先扣除它们的空间，再对其余种子求最优
+        keep_hashes = {h for h in info if info[h][5]}
+        forced = keep_hashes | {h for h in info if info[h][4] <= 0}
+        forced_weight = sum(info[h][4] for h in forced)
+        for h in keep_hashes:
+            logger.info(f"{prefix}保持下载（{info[h][5]}）: {info[h][0].name}，还需{StringUtils.str_filesize(info[h][1])}")
+        if forced_weight > budget_bytes:
+            logger.warning(f"{prefix}保持下载的种子共需{StringUtils.str_filesize(forced_weight)}，已超过可用预算，其它种子将全部暂停")
+
+        chosen = forced | self._knapsack_select([i for i in items if i[0] not in forced], budget_bytes - forced_weight)
         to_pause = [h for h in info if info[h][3] and h not in chosen]
         to_resume = [h for h in info if not info[h][3] and h in chosen]
-        chosen_size = sum(info[h][1] for h in chosen)
+        chosen_size = sum(info[h][4] for h in chosen)
         chosen_speed = sum(info[h][2] for h in chosen)
-        logger.info(f"{prefix}最优组合: {len(chosen)}个种子，需{StringUtils.str_filesize(chosen_size)}，"
+        logger.info(f"{prefix}最优组合: {len(chosen)}个种子（其中保持下载{len(keep_hashes)}个），需{StringUtils.str_filesize(chosen_size)}，"
                     f"预计总速度{chosen_speed:.2f}MB/s；暂停{len(to_pause)}个，恢复{len(to_resume)}个")
 
         paused_names, resumed_names = [], []
         for torrent_hash in to_pause:
-            torrent, remaining, speed, _ = info[torrent_hash]
+            torrent, remaining, speed = info[torrent_hash][:3]
             try:
                 if downloader_obj.stop_torrents(ids=[torrent_hash]):
                     paused_by_plugin.add(torrent_hash)
@@ -2051,7 +2083,7 @@ class QbOptimizerPlus(_PluginBase):
             except Exception as e:
                 logger.error(f"{prefix}暂停异常: {torrent.name}, 错误: {e}")
         for torrent_hash in to_resume:
-            torrent, remaining, speed, _ = info[torrent_hash]
+            torrent, remaining, speed = info[torrent_hash][:3]
             try:
                 if downloader_obj.start_torrents(ids=[torrent_hash]):
                     paused_by_plugin.discard(torrent_hash)
@@ -2486,7 +2518,7 @@ class QbOptimizerPlus(_PluginBase):
                                             'type': 'secondary',
                                             'variant': 'tonal',
                                             'title': '🔍 过滤设置',
-                                            'text': '设置排除条件，避免误删重要文件（对无人做种、慢速下载、识别不到媒体信息三项清理生效）'
+                                            'text': '命中任一条件的种子视为“保持下载”：不会被无人做种、慢速下载、识别不到媒体信息三项清理删除；下载阈值控制不会暂停它们（优先占用空间预算）；优先级优化会把它们置顶。'
                                         }
                                     }
                                 ]
