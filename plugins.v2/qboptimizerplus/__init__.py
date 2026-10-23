@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.8.1"
+    plugin_version = "1.9"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -144,6 +144,8 @@ class QbOptimizerPlus(_PluginBase):
         self._removed_hashes = set()
         self._recognized_cache = set()
         self._qb_settings_logged = set()
+        self._qb_log_last_id = {}
+        self._qb_error_reasons = {}
         self._events = {'replaced': [], 'kept': [], 'deleted': [], 'moved': [], 'synced': []}
         self._last_free_gb = None
         self._current_downloader = None
@@ -644,6 +646,7 @@ class QbOptimizerPlus(_PluginBase):
                     self._removed_hashes = set()
                     if self._enable_moved_clean:
                         self._sync_moved_files(downloader_obj, all_torrents)
+                    self._dedupe_torrents(downloader_obj, self._alive(all_torrents))
                     zero_seed_removed, zero_seed_failed = self._clean_zero_seed_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
                     timeout_removed, timeout_failed = self._clean_timeout_torrents(
@@ -2069,6 +2072,83 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"{prefix}清理{removed}个文件已被移走的已完成种子")
         return removed
 
+    # ---------------- 重复种子去重 ----------------
+    def _dedupe_torrents(self, downloader_obj, torrents):
+        """
+        同一保存目录下同名的种子会往同一个文件夹写同名文件，互相覆盖、出现 File exists / I/O 错误。
+        每组只保留下载量最多的一个（命中过滤设置的优先保留），其余未完成的只删除种子记录、不删除文件；
+        已完成的副本不处理（文件被整理移走后由清理功能处理）。
+        """
+        prefix = "【功能9-重复种子】"
+        groups = {}
+        for torrent in torrents:
+            key = ((getattr(torrent, 'save_path', '') or '').replace('\\', '/').rstrip('/'), torrent.name)
+            groups.setdefault(key, []).append(torrent)
+        for (_, name), members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda t: (bool(self._get_exclude_reason(t)), getattr(t, 'progress', 0) >= 1,
+                                        self._first_int_attr(t, ['downloaded', 'completed']), getattr(t, 'progress', 0)),
+                         reverse=True)
+            keeper = members[0]
+            for dup in members[1:]:
+                if getattr(dup, 'progress', 0) >= 1 or self._get_exclude_reason(dup):
+                    continue
+                try:
+                    downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=dup.hash)
+                except Exception as e:
+                    logger.warning(f"{prefix}删除重复种子失败: {dup.name}, 错误: {e}")
+                    continue
+                self._removed_hashes.add(dup.hash)
+                logger.info(f"{prefix}同目录同名重复，删除种子记录（保留文件）: {dup.name} "
+                            f"[{dup.hash[:8]} 进度{getattr(dup, 'progress', 0) * 100:.0f}%]，保留 [{keeper.hash[:8]} 进度{getattr(keeper, 'progress', 0) * 100:.0f}%]")
+                self._events['deleted'].append(
+                    f"• {self._name(dup.name)}\n  {StringUtils.str_filesize(getattr(dup, 'size', 0))} · 进度 {getattr(dup, 'progress', 0) * 100:.0f}%\n"
+                    f"  原因：同目录同名重复种子，保留进度 {getattr(keeper, 'progress', 0) * 100:.0f}% 的那个（文件保留）")
+
+    # ---------------- qB 报错原因 ----------------
+    ERROR_REASON_TEXT = {
+        'nospace': '写入失败：磁盘空间不足（No space left on device）',
+        'missing': '文件不存在（No such file or directory）',
+        'io': '读写出错（I/O error）',
+        'other': '其它错误',
+    }
+
+    def _refresh_qb_error_reasons(self, downloader_obj, downloader_name) -> dict:
+        """从 qB 日志解析每个种子最近一次文件错误的原因，增量读取"""
+        reasons = self._qb_error_reasons.setdefault(downloader_name, {})
+        try:
+            entries = downloader_obj.qbc.log_main(normal=False, info=False, warning=True, critical=True,
+                                                  last_known_id=self._qb_log_last_id.get(downloader_name, -1)) or []
+        except Exception as e:
+            logger.debug(f"【功能7-错误种子】读取qB日志失败: {e}")
+            return reasons
+        for entry in entries:
+            get = entry.get if hasattr(entry, 'get') else (lambda k, d=None: getattr(entry, k, d))
+            self._qb_log_last_id[downloader_name] = get('id', self._qb_log_last_id.get(downloader_name, -1))
+            message = str(get('message', '') or '')
+            name = re.search(r'Torrent[：:]\s*[“"](.+?)[”"]', message)
+            if not name:
+                continue
+            if 'No space left' in message:
+                category = 'nospace'
+            elif 'No such file' in message:
+                category = 'missing'
+            elif 'I/O error' in message or 'Input/output error' in message:
+                category = 'io'
+            elif 'error' in message.lower():
+                category = 'other'
+            else:
+                continue
+            detail = re.search(r'(file_\w+)\s*\((.+?)\)\s*error:\s*([^”"]+)', message)
+            reasons[name.group(1)] = {
+                'category': category,
+                'op': detail.group(1) if detail else '',
+                'file': detail.group(2) if detail else '',
+                'ts': get('timestamp', 0),
+            }
+        return reasons
+
     def _handle_error_torrents(self, downloader_obj, torrents, downloader_name):
         """
         处理报错的种子（error / missingFiles）：
@@ -2100,11 +2180,14 @@ class QbOptimizerPlus(_PluginBase):
         free_gb = self._get_free_space_gb(downloader_obj)
         space_ok = free_gb is None or free_gb >= self._min_disk_space_threshold
         timeout_seconds = self._error_timeout_hours * 3600
+        qb_reasons = self._refresh_qb_error_reasons(downloader_obj, downloader_name)
 
         to_delete, to_notify = [], []
         for torrent in error_torrents:
             state = getattr(torrent, 'state', '')
             record = records.get(torrent.hash) or {'first': now, 'retries': 0, 'notified': False}
+            reason = qb_reasons.get(torrent.name) or {}
+            record['reason'] = reason.get('category', '')
             hours = (now - record['first']) / 3600
             completed = getattr(torrent, 'progress', 0) >= 1
             keep_reason = self._get_exclude_reason(torrent)
@@ -2118,17 +2201,23 @@ class QbOptimizerPlus(_PluginBase):
                 logger.info(f"{prefix}文件已被MP整理移走过，由同步逻辑处理，不删除: {torrent.name}")
                 continue
 
+            # 磁盘写入失败是存储问题，删掉重下同样会失败，不做超时替换
             if (timeout_seconds > 0 and now - record['first'] >= timeout_seconds
-                    and not completed and not keep_reason):
+                    and not completed and not keep_reason and record['reason'] != 'nospace'):
                 logger.info(f"{prefix}持续报错{hours:.1f}小时，超过{self._error_timeout_hours}小时: {torrent.name}（{state}）")
                 to_delete.append((torrent, hours))
                 records[torrent.hash] = record
                 continue
 
-            if space_ok:
-                if self._retry_error_torrent(downloader_obj, torrent):
+            reason_text = self.ERROR_REASON_TEXT.get(record['reason'], '原因未知')
+            if now < record.get('next_retry', 0):
+                logger.info(f"{prefix}{reason_text}，{(record['next_retry'] - now) / 60:.0f}分钟后再重试: {torrent.name}")
+            elif space_ok:
+                if self._retry_error_torrent(downloader_obj, torrent, record['reason']):
                     record['retries'] += 1
-                    logger.info(f"{prefix}第{record['retries']}次重试（{state}，已报错{hours:.1f}小时）: {torrent.name}")
+                    # 退避重试：5、10、20…分钟，最长2小时，避免反复失败刷满日志
+                    record['next_retry'] = now + min(300 * 2 ** (record['retries'] - 1), 7200)
+                    logger.info(f"{prefix}第{record['retries']}次重试（{state}，{reason_text}，已报错{hours:.1f}小时）: {torrent.name}")
             else:
                 logger.info(f"{prefix}磁盘剩余{free_gb:.1f}GB低于{self._min_disk_space_threshold}GB，暂不重试: {torrent.name}")
 
@@ -2138,9 +2227,13 @@ class QbOptimizerPlus(_PluginBase):
             records[torrent.hash] = record
 
         if to_notify:
+            reasons_for = {t.hash: (records.get(t.hash) or {}).get('reason', '') for t, *_ in to_notify}
             lines = []
             for torrent, hours, completed, keep_reason in to_notify:
-                if completed:
+                if reasons_for.get(torrent.hash) == 'nospace':
+                    plan = (f"qB 显示剩余 {free_gb:.0f}G 但写入失败，属于存储问题（inode/合并盘/挂载/配额），"
+                            f"删掉重下也会失败，只退避重试，请检查存储") if free_gb is not None else "磁盘写入失败，请检查存储"
+                elif completed:
                     plan = "已下载完成，只重试不删除"
                 elif keep_reason:
                     plan = f"{keep_reason}，只重试不删除"
@@ -2149,7 +2242,7 @@ class QbOptimizerPlus(_PluginBase):
                     plan = f"约 {left:.0f} 小时后删除并搜索替代资源"
                 else:
                     plan = "未开启超时删除，需手动处理"
-                lines.append(f"• {self._name(torrent.name)}\n  {getattr(torrent, 'state', '')} · 已报错 {hours:.1f} 小时 · "
+                lines.append(f"• {self._name(torrent.name)}\n  {self.ERROR_REASON_TEXT.get(reasons_for.get(torrent.hash), '原因未知')}\n  {getattr(torrent, 'state', '')} · 已报错 {hours:.1f} 小时 · "
                              f"进度 {getattr(torrent, 'progress', 0) * 100:.0f}%\n  路径：{self._name(getattr(torrent, 'save_path', ''))}\n  处理：{plan}")
             self._send('error', f"❗ {self._notify_prefix}｜{len(to_notify)} 个种子重试 3 次仍报错",
                        self._section("报错种子", lines)
@@ -2170,9 +2263,10 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"{prefix}报错种子{len(error_torrents)}个，删除{removed}个")
         return removed, redownload_failed
 
-    def _retry_error_torrent(self, downloader_obj, torrent) -> bool:
+    def _retry_error_torrent(self, downloader_obj, torrent, reason: str = '') -> bool:
         try:
-            if (getattr(torrent, 'state', '') or '').lower() == 'missingfiles':
+            # 文件丢失或读写出错：先重新校验，让 qB 找出缺失/损坏的分块重新下载；磁盘写满等其它原因直接继续
+            if (getattr(torrent, 'state', '') or '').lower() == 'missingfiles' or reason in ('missing', 'io'):
                 downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
             return bool(downloader_obj.start_torrents(ids=[torrent.hash]))
         except Exception as e:
