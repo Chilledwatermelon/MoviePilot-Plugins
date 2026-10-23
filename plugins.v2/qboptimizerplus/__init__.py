@@ -39,7 +39,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -119,6 +119,10 @@ class QbOptimizerPlus(_PluginBase):
     _ai_api_key = ""
     _ai_calls_this_run = 0
 
+    # 错误种子处理
+    _enable_error_handle = True
+    _error_timeout_hours = 24        # 持续报错超过N小时删除并重新下载，0为不删除
+
     # qB 中表示“无限”的 ETA 值
     QB_ETA_INFINITY = 8640000
     PROBE_CACHE_TTL = 6 * 3600
@@ -190,6 +194,9 @@ class QbOptimizerPlus(_PluginBase):
             self._redownload_min_seeders = int(config.get("redownload_min_seeders") or 3)
             self._redownload_size_tolerance = int(config.get("redownload_size_tolerance", 50) or 0)
             self._redownload_max_attempts = int(config.get("redownload_max_attempts") or 3)
+
+            self._enable_error_handle = bool(config.get("enable_error_handle", True))
+            self._error_timeout_hours = int(config.get("error_timeout_hours", 24) or 0)
 
             self._ai_enabled = bool(config.get("ai_enabled", False))
             self._ai_model = (config.get("ai_model") or "").strip()
@@ -582,6 +589,7 @@ class QbOptimizerPlus(_PluginBase):
         self._ai_calls_this_run = 0
         total_timeout_removed = 0
         total_unrecognized_removed = 0
+        total_error_removed = 0
         all_failed_torrents = []  # 收集所有重新下载失败的种子
         
         for downloader_name in self._downloaders:
@@ -642,6 +650,8 @@ class QbOptimizerPlus(_PluginBase):
                         downloader_obj, self._alive(all_torrents), downloader_name)
                     unrecognized_removed = self._clean_unrecognized_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
+                    error_removed, error_failed = self._handle_error_torrents(
+                        downloader_obj, self._alive(all_torrents), downloader_name)
                     priority_boosted = self._boost_priority_torrents(
                         downloader_obj, self._alive(all_torrents), downloader_name)
 
@@ -657,10 +667,12 @@ class QbOptimizerPlus(_PluginBase):
                     total_priority_boosted += priority_boosted
                     total_timeout_removed += timeout_removed
                     total_unrecognized_removed += unrecognized_removed
+                    total_error_removed += error_removed
                     
                     # 收集重新下载失败信息
                     all_failed_torrents.extend(zero_seed_failed)
                     all_failed_torrents.extend(timeout_failed)
+                    all_failed_torrents.extend(error_failed)
                     
                     logger.info(f"【QB种子优化】{downloader_name} 优化完成:")
                     logger.info(f"  - 清理下载中无人做种: {zero_seed_removed}个")
@@ -679,12 +691,13 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"  - 综合评分优化: {total_priority_boosted}个")
         logger.info(f"  - 清理慢速下载: {total_timeout_removed}个")
         logger.info(f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个")
+        logger.info(f"  - 清理长期报错种子: {total_error_removed}个")
         logger.info(f"  - 重新下载失败: {len(all_failed_torrents)}个")
         
         # 输出详细总结信息
-        if total_zero_seed_removed > 0 or total_timeout_removed > 0 or total_unrecognized_removed > 0:
+        if total_zero_seed_removed > 0 or total_timeout_removed > 0 or total_unrecognized_removed > 0 or total_error_removed > 0 or all_failed_torrents:
             logger.info(f"【QB种子优化】本次清理总结:")
-            logger.info(f"  清理种子总数: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed}个")
+            logger.info(f"  清理种子总数: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个")
             logger.info(f"  - 清理下载中无人做种: {total_zero_seed_removed}个")
             logger.info(f"  - 清理慢速下载: {total_timeout_removed}个")
             logger.info(f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个")
@@ -700,10 +713,11 @@ class QbOptimizerPlus(_PluginBase):
                 # 发送通知
                 if self._notify:
                     summary_message = f"【QB种子优化完成】\n"
-                    summary_message += f"本次清理种子: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed}个\n"
+                    summary_message += f"本次清理种子: {total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个\n"
                     summary_message += f"  - 清理下载中无人做种: {total_zero_seed_removed}个\n"
                     summary_message += f"  - 清理慢速下载: {total_timeout_removed}个\n"
                     summary_message += f"  - 清理识别不到媒体信息: {total_unrecognized_removed}个\n"
+                    summary_message += f"  - 清理长期报错种子: {total_error_removed}个\n"
                     summary_message += f"重新下载失败: {len(all_failed_torrents)}个\n\n"
                     summary_message += "失败种子列表:\n"
                     for i, failed_torrent in enumerate(all_failed_torrents, 1):
@@ -712,7 +726,7 @@ class QbOptimizerPlus(_PluginBase):
                         summary_message += f"   大小: {failed_torrent['size']}\n"
                         summary_message += f"   原因: {failed_torrent['reason']}\n\n"
                     
-                    logger.info(f"【QB种子优化】发送总结通知: 清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed}个，失败{len(all_failed_torrents)}个")
+                    logger.info(f"【QB种子优化】发送总结通知: 清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个，失败{len(all_failed_torrents)}个")
                     self.post_message(
                         mtype=NotificationType.Manual,
                         title=f"【QB种子优化】清理完成 - {len(all_failed_torrents)}个种子未找到资源",
@@ -721,7 +735,7 @@ class QbOptimizerPlus(_PluginBase):
             else:
                 logger.info(f"【QB种子优化】重新下载成功总结: 清理的{total_zero_seed_removed + total_timeout_removed}个种子全部重新下载成功")
                 if self._notify:
-                    logger.info(f"【QB种子优化】清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed}个种子，全部重新下载成功，无需发送通知")
+                    logger.info(f"【QB种子优化】清理{total_zero_seed_removed + total_timeout_removed + total_unrecognized_removed + total_error_removed}个种子，全部重新下载成功，无需发送通知")
         else:
             logger.info(f"【QB种子优化】本次无清理操作，无需发送通知")
 
@@ -775,11 +789,8 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"{prefix}删除审计 ({i}/{len(zero_seed_torrents)}): {torrent.name} | HASH={torrent.hash} | "
                         f"进度={getattr(torrent, 'progress', 0) * 100:.1f}% | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | "
                         f"分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
-            torrent_info = self._snapshot_torrent(torrent)
-            if not self._delete_torrent(downloader_obj, torrent, torrents, prefix):
-                continue
-            removed += 1
-            failed = self._maybe_redownload(torrent_info, '无人做种', prefix)
+            ok, failed = self._replace_torrent(downloader_obj, torrent, torrents, '无人做种', prefix)
+            removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
         return removed, redownload_failed_torrents
@@ -1206,26 +1217,62 @@ class QbOptimizerPlus(_PluginBase):
             logger.error(f"{prefix}删除失败: {torrent.name}")
         return ok
 
-    def _maybe_redownload(self, torrent_info: dict, reason: str, prefix: str) -> Optional[dict]:
-        """按配置重新下载，失败时返回用于通知的失败记录"""
-        if not self._enable_auto_redownload:
-            logger.info(f"{prefix}自动重新下载已禁用: {torrent_info['name']}")
-            return None
-        if not self._search_sites:
-            logger.info(f"{prefix}未配置搜索站点，跳过重新下载: {torrent_info['name']}")
-            return None
+    # 未找到替代资源时，同一种子间隔多久再搜索
+    REPLACEMENT_RETRY_SECONDS = 6 * 3600
+
+    def _replace_torrent(self, downloader_obj, torrent, all_torrents, reason: str, prefix: str) -> Tuple[bool, Optional[dict]]:
+        """
+        替换一个需要清理的种子：先搜索并提交替代资源，成功后才删除原种子；
+        找不到替代资源时保留原种子（进了qB的内容不丢），首次失败时返回通知记录，6小时后再搜。
+        未开启自动重新下载时直接删除。返回 (是否删除了原种子, 失败记录或None)。
+        """
+        if not self._enable_auto_redownload or not self._search_sites:
+            why = "自动重新下载已禁用" if not self._enable_auto_redownload else "未配置搜索站点"
+            logger.info(f"{prefix}{why}，直接删除: {torrent.name}")
+            return self._delete_torrent(downloader_obj, torrent, all_torrents, prefix), None
+
+        now = int(time.time())
+        current = {t.hash for t in all_torrents}
+        try:
+            misses = {h: v for h, v in dict(self.get_data('replacement_miss') or {}).items() if h in current}
+        except Exception:
+            misses = {}
+        miss = misses.get(torrent.hash)
+        if miss and now - miss.get('ts', 0) < self.REPLACEMENT_RETRY_SECONDS:
+            wait_hours = (self.REPLACEMENT_RETRY_SECONDS - (now - miss['ts'])) / 3600
+            logger.info(f"{prefix}之前未找到替代资源，{wait_hours:.1f}小时后再搜，保留原种子: {torrent.name}")
+            return False, None
+
+        torrent_info = self._snapshot_torrent(torrent)
         ok, fail_reason = self._re_download_torrent(torrent_info)
         if ok:
-            return None
-        return {
+            misses.pop(torrent.hash, None)
+            self._save_replacement_misses(misses)
+            # 重新获取种子列表：替代资源若与原种子文件同名同目录，会被识别为共用数据，删除时保留文件
+            fresh, error = downloader_obj.get_torrents()
+            return self._delete_torrent(downloader_obj, torrent, fresh if not error and fresh else all_torrents, prefix), None
+
+        first_miss = not miss
+        misses[torrent.hash] = {'ts': now, 'count': (miss or {}).get('count', 0) + 1}
+        self._save_replacement_misses(misses)
+        logger.warning(f"{prefix}{fail_reason}，保留原种子: {torrent.name}")
+        if not first_miss:
+            return False, None
+        return False, {
             'name': torrent_info['name'],
             'hash': torrent_info['hash'],
             'size': StringUtils.str_filesize(torrent_info['size']),
             'category': torrent_info.get('category') or 'N/A',
             'tags': torrent_info.get('tags') or 'N/A',
             'tracker': torrent_info.get('tracker') or 'N/A',
-            'reason': f"{reason}；{fail_reason}"
+            'reason': f"{reason}；{fail_reason}，已保留原种子"
         }
+
+    def _save_replacement_misses(self, misses: dict):
+        try:
+            self.save_data('replacement_miss', misses)
+        except Exception as e:
+            logger.debug(f"【重新下载】保存记录失败: {e}")
 
     @staticmethod
     def _split_lines(text) -> List[str]:
@@ -1466,12 +1513,9 @@ class QbOptimizerPlus(_PluginBase):
         for i, (torrent, active_seconds, remaining_text) in enumerate(timeout_torrents, 1):
             logger.info(f"{prefix}删除审计 ({i}/{len(timeout_torrents)}): {torrent.name} | HASH={torrent.hash} | "
                         f"速度={StringUtils.str_filesize(getattr(torrent, 'dlspeed', 0))}/s | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))}")
-            torrent_info = self._snapshot_torrent(torrent)
-            if not self._delete_torrent(downloader_obj, torrent, torrents, prefix):
-                continue
-            removed += 1
-            failed = self._maybe_redownload(
-                torrent_info, f'慢速下载：活跃{active_seconds / 3600:.1f}小时，预计剩余{remaining_text}', prefix)
+            ok, failed = self._replace_torrent(
+                downloader_obj, torrent, torrents, f'慢速下载：活跃{active_seconds / 3600:.1f}小时，预计剩余{remaining_text}', prefix)
+            removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
         return removed, redownload_failed_torrents
@@ -1507,6 +1551,36 @@ class QbOptimizerPlus(_PluginBase):
         让 AI 根据种子名推测片名、年份、类型，再交给 TMDB 识别核对。
         AI 只提供线索，必须 TMDB 识别成功才采用；结果按种子名缓存，避免重复调用。
         """
+        guess = self._ai_guess(torrent_name)
+        if not guess or not guess.get('title'):
+            return None
+        prefix = "【AI辅助识别】"
+        media_chain = MediaChain()
+        for title in [guess.get('title'), guess.get('original_title')]:
+            if not title:
+                continue
+            meta = MetaInfo(title)
+            if guess.get('year'):
+                meta.year = str(guess['year'])
+            if guess.get('type') == 'tv':
+                meta.type = MediaType.TV
+                if guess.get('season'):
+                    meta.begin_season = guess['season']
+            elif guess.get('type') == 'movie':
+                meta.type = MediaType.MOVIE
+            try:
+                mediainfo = media_chain.recognize_by_meta(meta)
+            except Exception as e:
+                logger.warning(f"{prefix}TMDB核对异常: {e}")
+                mediainfo = None
+            if mediainfo:
+                logger.info(f"{prefix}{torrent_name} -> AI推测「{title} {guess.get('year') or ''}」-> TMDB确认: {mediainfo.title_year}")
+                return mediainfo
+        logger.info(f"{prefix}AI推测「{guess.get('title')} {guess.get('year') or ''}」但TMDB未能确认，不采用: {torrent_name}")
+        return None
+
+    def _ai_guess(self, torrent_name: str) -> Optional[dict]:
+        """AI 根据种子名推测作品信息（带缓存和每轮调用上限），未启用或失败时返回None"""
         if not self._ai_enabled or not torrent_name:
             return None
         prefix = "【AI辅助识别】"
@@ -1533,31 +1607,7 @@ class QbOptimizerPlus(_PluginBase):
 
         if not guess or not guess.get('title'):
             logger.info(f"{prefix}AI未能判断作品: {torrent_name}")
-            return None
-
-        media_chain = MediaChain()
-        for title in [guess.get('title'), guess.get('original_title')]:
-            if not title:
-                continue
-            meta = MetaInfo(title)
-            if guess.get('year'):
-                meta.year = str(guess['year'])
-            if guess.get('type') == 'tv':
-                meta.type = MediaType.TV
-                if guess.get('season'):
-                    meta.begin_season = guess['season']
-            elif guess.get('type') == 'movie':
-                meta.type = MediaType.MOVIE
-            try:
-                mediainfo = media_chain.recognize_by_meta(meta)
-            except Exception as e:
-                logger.warning(f"{prefix}TMDB核对异常: {e}")
-                mediainfo = None
-            if mediainfo:
-                logger.info(f"{prefix}{torrent_name} -> AI推测「{title} {guess.get('year') or ''}」-> TMDB确认: {mediainfo.title_year}")
-                return mediainfo
-        logger.info(f"{prefix}AI推测「{guess.get('title')} {guess.get('year') or ''}」但TMDB未能确认，不采用: {torrent_name}")
-        return None
+        return guess
 
     def _ask_ai_for_media(self, torrent_name: str) -> Optional[dict]:
         """调用 MoviePilot 系统中配置的大模型；插件里填写了模型/地址/密钥时覆盖系统设置"""
@@ -1696,6 +1746,122 @@ class QbOptimizerPlus(_PluginBase):
             if self._delete_torrent(downloader_obj, torrent, torrents, prefix):
                 removed += 1
         return removed
+
+    def _handle_error_torrents(self, downloader_obj, torrents, downloader_name):
+        """
+        处理报错的种子（error / missingFiles）：
+        1. 每轮自动重试：error 执行继续，missingFiles 先重新校验再继续（磁盘空间不足时不重试）
+        2. 连续重试3轮仍报错时通知一次
+        3. 未完成的种子持续报错超过N小时：删除并搜索替代资源重新下载（N为0时不删除）
+        已完成的做种种子和命中过滤设置的种子只重试、通知，不删除。
+        """
+        prefix = "【功能7-错误种子】"
+        if not self._enable_error_handle:
+            logger.info(f"{prefix}功能已禁用，跳过")
+            return 0, []
+
+        now = int(time.time())
+        try:
+            records = dict(self.get_data('error_torrents') or {})
+        except Exception:
+            records = {}
+
+        error_torrents = [t for t in torrents
+                          if (getattr(t, 'state', '') or '').lower() in ('error', 'missingfiles')]
+        error_hashes = {t.hash for t in error_torrents}
+        records = {h: v for h, v in records.items() if h in error_hashes}
+        if not error_torrents:
+            self._save_error_records(records)
+            logger.info(f"{prefix}没有报错的种子")
+            return 0, []
+
+        free_gb = self._get_free_space_gb(downloader_obj)
+        space_ok = free_gb is None or free_gb >= self._min_disk_space_threshold
+        timeout_seconds = self._error_timeout_hours * 3600
+
+        to_delete, to_notify = [], []
+        for torrent in error_torrents:
+            state = getattr(torrent, 'state', '')
+            record = records.get(torrent.hash) or {'first': now, 'retries': 0, 'notified': False}
+            hours = (now - record['first']) / 3600
+            completed = getattr(torrent, 'progress', 0) >= 1
+            keep_reason = self._get_exclude_reason(torrent)
+
+            if (timeout_seconds > 0 and now - record['first'] >= timeout_seconds
+                    and not completed and not keep_reason):
+                logger.info(f"{prefix}持续报错{hours:.1f}小时，超过{self._error_timeout_hours}小时: {torrent.name}（{state}）")
+                to_delete.append((torrent, hours))
+                records[torrent.hash] = record
+                continue
+
+            if space_ok:
+                if self._retry_error_torrent(downloader_obj, torrent):
+                    record['retries'] += 1
+                    logger.info(f"{prefix}第{record['retries']}次重试（{state}，已报错{hours:.1f}小时）: {torrent.name}")
+            else:
+                logger.info(f"{prefix}磁盘剩余{free_gb:.1f}GB低于{self._min_disk_space_threshold}GB，暂不重试: {torrent.name}")
+
+            if record['retries'] >= 3 and not record.get('notified'):
+                to_notify.append((torrent, hours, completed, keep_reason))
+                record['notified'] = True
+            records[torrent.hash] = record
+
+        if to_notify and self._notify:
+            lines = []
+            for torrent, hours, completed, keep_reason in to_notify:
+                if completed:
+                    plan = "已完成的种子不会自动删除"
+                elif keep_reason:
+                    plan = "命中过滤设置，不会自动删除"
+                elif self._error_timeout_hours > 0:
+                    plan = f"报错满{self._error_timeout_hours}小时将删除并重新下载"
+                else:
+                    plan = "未开启超时删除"
+                lines.append(f"- {torrent.name}\n  状态: {getattr(torrent, 'state', '')} | 已报错{hours:.1f}小时 | "
+                             f"路径: {getattr(torrent, 'save_path', '')}\n  {plan}")
+            self.post_message(mtype=NotificationType.Manual,
+                              title=f"【QB种子优化Plus】{len(to_notify)}个种子重试3次仍报错",
+                              text="\n".join(lines) + "\n\n常见原因：磁盘写满、保存路径不可写或挂载断开、文件被删除或移动")
+
+        removed = 0
+        redownload_failed = []
+        for torrent, hours in to_delete[:self._max_zero_seed_process]:
+            ok, failed = self._replace_torrent(
+                downloader_obj, torrent, torrents, f'报错{hours:.1f}小时（{getattr(torrent, "state", "")}）', prefix)
+            if ok:
+                removed += 1
+                records.pop(torrent.hash, None)
+            if failed:
+                redownload_failed.append(failed)
+
+        self._save_error_records(records)
+        logger.info(f"{prefix}报错种子{len(error_torrents)}个，删除{removed}个")
+        return removed, redownload_failed
+
+    def _retry_error_torrent(self, downloader_obj, torrent) -> bool:
+        try:
+            if (getattr(torrent, 'state', '') or '').lower() == 'missingfiles':
+                downloader_obj.qbc.torrents_recheck(torrent_hashes=torrent.hash)
+            return bool(downloader_obj.start_torrents(ids=[torrent.hash]))
+        except Exception as e:
+            logger.warning(f"【功能7-错误种子】重试失败: {torrent.name}, 错误: {e}")
+            return False
+
+    def _save_error_records(self, records: dict):
+        try:
+            self.save_data('error_torrents', records)
+        except Exception as e:
+            logger.debug(f"【功能7-错误种子】保存记录失败: {e}")
+
+    @staticmethod
+    def _get_free_space_gb(downloader_obj) -> Optional[float]:
+        try:
+            response = downloader_obj.qbc._request(http_method='POST', api_namespace='sync',
+                                                   api_method='maindata', data={'rid': 0})
+            free = (response.json().get('server_state') or {}).get('free_space_on_disk')
+            return float(free) / 1024 ** 3 if free is not None else None
+        except Exception:
+            return None
 
     def _check_system_status_once(self, qb_client, check_disk_space=True):
         """
@@ -2152,6 +2318,13 @@ class QbOptimizerPlus(_PluginBase):
                 running.append(torrent)
 
         running_hashes = {t.hash for t in running}
+        # 全局下载限速（如磁盘/IO监控触发）时速度失真，不更新平滑速度，沿用之前的记录
+        try:
+            download_limited = (downloader_obj.get_speed_limit() or (0, 0))[0] > 0
+        except Exception:
+            download_limited = False
+        if download_limited:
+            logger.info(f"{prefix}下载器处于全局限速状态，本轮沿用之前记录的平均速度")
         now = time.time()
         items = []
         info = {}
@@ -2164,8 +2337,11 @@ class QbOptimizerPlus(_PluginBase):
             if is_running:
                 current = (getattr(torrent, 'dlspeed', 0) or 0) / 1024 ** 2
                 previous = speed_ema.get(torrent.hash)
-                speed = current if previous is None else 0.6 * current + 0.4 * previous
-                speed_ema[torrent.hash] = round(speed, 3)
+                if download_limited:
+                    speed = current if previous is None else previous
+                else:
+                    speed = current if previous is None else 0.6 * current + 0.4 * previous
+                    speed_ema[torrent.hash] = round(speed, 3)
             else:
                 speed = speed_ema.get(torrent.hash, 0.0)
             # 等待补偿：暂停期间按小时累积，恢复后保留到下载完成，避免慢种子永远轮不到
@@ -2363,6 +2539,21 @@ class QbOptimizerPlus(_PluginBase):
             if not page_results:
                 break
         logger.info(f"{prefix}按标题「{keyword}」搜索，得到{len(results)}个候选")
+        if results:
+            return results
+
+        guess = self._ai_guess(name) or {}
+        for alt in [guess.get('title'), guess.get('original_title')]:
+            if not alt or alt == keyword:
+                continue
+            try:
+                results = search_chain.search_by_title(title=alt, page=0, sites=sites) or []
+            except Exception as e:
+                logger.error(f"{prefix}按AI给出的名称搜索失败: {e}")
+                continue
+            logger.info(f"{prefix}按AI给出的名称「{alt}」搜索，得到{len(results)}个候选")
+            if results:
+                return results
         return results
 
     @staticmethod
@@ -2987,6 +3178,69 @@ class QbOptimizerPlus(_PluginBase):
                             }
                         ]
                     },
+
+                    # 错误种子处理
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'text': '处理报错的种子'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enable_error_handle', 'label': '启用报错种子处理'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'error_timeout_hours',
+                                            'label': '报错超过N小时删除并重新下载（0为不删除）',
+                                            'placeholder': '24',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '每轮自动重试（文件丢失的先重新校验），磁盘空间不足时不重试；重试3次仍报错会通知。'
+                                                    '已完成的做种种子和命中过滤设置的种子只重试不删除。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     
                     # 综合评分优先级配置组
                     {
@@ -3497,7 +3751,8 @@ class QbOptimizerPlus(_PluginBase):
                                             'variant': 'tonal',
                                             'density': 'compact',
                                             'text': '重新下载优先用 MoviePilot 下载历史中的 TMDB ID 识别，按媒体信息精确搜索，识别失败才按片名搜索；'
-                                                    '候选资源需季集一致、大小相近、做种数达标，按做种数从高到低选择，下载到原下载器和原目录。'
+                                                    '候选资源需季集一致、大小相近、做种数达标，按做种数从高到低选择，下载到原下载器和原目录；仍搜不到时用AI给出的中文名/原名再搜。'
+                                                    '先成功提交替代资源再删除原种子，找不到替代资源时保留原种子并通知，6小时后再搜。'
                                         }
                                     }
                                 ]
@@ -3709,6 +3964,9 @@ class QbOptimizerPlus(_PluginBase):
             "redownload_max_attempts": 3,
             # AI 辅助识别
             "ai_enabled": False,
+            # 错误种子处理
+            "enable_error_handle": True,
+            "error_timeout_hours": 24,
             "ai_model": "",
             "ai_base_url": "",
             "ai_api_key": "",
