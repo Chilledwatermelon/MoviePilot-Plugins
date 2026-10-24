@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.9"
+    plugin_version = "1.10.10"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2201,36 +2201,58 @@ class QbOptimizerPlus(_PluginBase):
     # ---------------- 重复种子去重 ----------------
     def _dedupe_torrents(self, downloader_obj, torrents):
         """
-        同一保存目录下同名的种子会往同一个文件夹写同名文件，互相覆盖、出现 File exists / I/O 错误。
+        同一保存目录下同名、且文件完全相同的种子会往同一个文件夹写同名文件，互相覆盖、出现 File exists / I/O 错误。
         每组只保留下载量最多的一个（命中过滤设置的优先保留），其余未完成的只删除种子记录、不删除文件；
         已完成的副本不处理（文件被整理移走后由清理功能处理）。
+        同名但文件不同的（如每集一个种子却共用季包名）不是重复，不处理；取不到文件列表时也不处理。
         """
         prefix = "【功能9-重复种子】"
         groups = {}
         for torrent in torrents:
             key = ((getattr(torrent, 'save_path', '') or '').replace('\\', '/').rstrip('/'), torrent.name)
             groups.setdefault(key, []).append(torrent)
-        for (_, name), members in groups.items():
-            if len(members) < 2:
+        for (_, name), named in groups.items():
+            if len(named) < 2:
                 continue
-            members.sort(key=lambda t: (bool(self._get_exclude_reason(t)), getattr(t, 'progress', 0) >= 1,
-                                        self._first_int_attr(t, ['downloaded', 'completed']), getattr(t, 'progress', 0)),
-                         reverse=True)
-            keeper = members[0]
-            for dup in members[1:]:
-                if getattr(dup, 'progress', 0) >= 1 or self._get_exclude_reason(dup):
-                    continue
-                try:
-                    downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=dup.hash)
-                except Exception as e:
-                    logger.warning(f"{prefix}删除重复种子失败: {dup.name}, 错误: {e}")
-                    continue
-                self._removed_hashes.add(dup.hash)
-                logger.info(f"{prefix}同目录同名重复，删除种子记录（保留文件）: {dup.name} "
-                            f"[{dup.hash[:8]} 进度{getattr(dup, 'progress', 0) * 100:.0f}%]，保留 [{keeper.hash[:8]} 进度{getattr(keeper, 'progress', 0) * 100:.0f}%]")
-                self._events['deleted'].append(
-                    f"• {self._name(dup.name)}\n  {StringUtils.str_filesize(getattr(dup, 'size', 0))} · 进度 {getattr(dup, 'progress', 0) * 100:.0f}%\n"
-                    f"  原因：同目录同名重复种子，保留进度 {getattr(keeper, 'progress', 0) * 100:.0f}% 的那个（文件保留）")
+            by_files = {}
+            for torrent in named:
+                by_files.setdefault(self._files_signature(downloader_obj, torrent), []).append(torrent)
+            if len(by_files) > 1:
+                logger.info(f"{prefix}{name}: {len(named)}个同名种子的文件不同（如每集一个种子），只合并文件相同的")
+            for signature, members in by_files.items():
+                if signature is not None and len(members) > 1:
+                    self._dedupe_same_files(downloader_obj, members, prefix)
+
+    @staticmethod
+    def _files_signature(downloader_obj, torrent):
+        """种子内文件的（路径，大小）集合，用于判断同名种子是否真的是同一份内容"""
+        try:
+            files = downloader_obj.get_files(tid=torrent.hash)
+        except Exception:
+            return None
+        if not files:
+            return None
+        return tuple(sorted((str(getattr(f, 'name', '')), int(getattr(f, 'size', 0) or 0)) for f in files))
+
+    def _dedupe_same_files(self, downloader_obj, members, prefix):
+        members.sort(key=lambda t: (bool(self._get_exclude_reason(t)), getattr(t, 'progress', 0) >= 1,
+                                    self._first_int_attr(t, ['downloaded', 'completed']), getattr(t, 'progress', 0)),
+                     reverse=True)
+        keeper = members[0]
+        for dup in members[1:]:
+            if getattr(dup, 'progress', 0) >= 1 or self._get_exclude_reason(dup):
+                continue
+            try:
+                downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=dup.hash)
+            except Exception as e:
+                logger.warning(f"{prefix}删除重复种子失败: {dup.name}, 错误: {e}")
+                continue
+            self._removed_hashes.add(dup.hash)
+            logger.info(f"{prefix}同目录同名重复，删除种子记录（保留文件）: {dup.name} "
+                        f"[{dup.hash[:8]} 进度{getattr(dup, 'progress', 0) * 100:.0f}%]，保留 [{keeper.hash[:8]} 进度{getattr(keeper, 'progress', 0) * 100:.0f}%]")
+            self._events['deleted'].append(
+                f"• {self._name(dup.name)}\n  {StringUtils.str_filesize(getattr(dup, 'size', 0))} · 进度 {getattr(dup, 'progress', 0) * 100:.0f}%\n"
+                f"  原因：同目录同名重复种子，保留进度 {getattr(keeper, 'progress', 0) * 100:.0f}% 的那个（文件保留）")
 
     # ---------------- qB 报错原因 ----------------
     ERROR_REASON_TEXT = {
