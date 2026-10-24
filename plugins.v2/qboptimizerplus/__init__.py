@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.11"
+    plugin_version = "1.10.12"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -3278,6 +3278,13 @@ class QbOptimizerPlus(_PluginBase):
         except Exception as e:
             logger.debug(f"【重新下载】保存重试记录失败: {e}")
 
+    @staticmethod
+    def _movie_but_has_episodes(mediainfo, meta) -> bool:
+        """识别结果是电影，种子名却带季号或集号，说明识别有误"""
+        if getattr(mediainfo, 'type', None) != MediaType.MOVIE:
+            return False
+        return bool(getattr(meta, 'begin_episode', None) or getattr(meta, 'begin_season', None))
+
     def _recognize_for_redownload(self, torrent_hash: str, meta) -> Optional[MediaInfo]:
         prefix = "【重新下载】"
         media_chain = MediaChain()
@@ -3286,6 +3293,11 @@ class QbOptimizerPlus(_PluginBase):
             try:
                 mtype = MediaType(history.type) if getattr(history, 'type', None) else None
                 mediainfo = media_chain.recognize_media(mtype=mtype, tmdbid=history.tmdbid)
+                if mediainfo and self._movie_but_has_episodes(mediainfo, meta):
+                    # 例：综艺 Running Man 2019 年的合集被下载历史记成同名电影，按电影搜替代资源会搜错、整理也会错
+                    logger.warning(f"{prefix}下载历史记为电影 {mediainfo.title_year}，但种子名带季/集"
+                                   f"（{getattr(meta, 'season_episode', '')}），不采用，改按种子名识别")
+                    mediainfo = None
                 if mediainfo:
                     logger.info(f"{prefix}按下载历史TMDB ID识别: {mediainfo.title_year}")
                     return mediainfo
