@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.8"
+    plugin_version = "1.10.9"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -85,6 +85,7 @@ class QbOptimizerPlus(_PluginBase):
     _speed_weight = 1.0             # 下载速度权重
     _seeder_weight = 0.5            # 做种数权重
     _min_score_threshold = 1.0      # 最低综合评分阈值
+    _new_first_hours = 24.0         # 新种子优先：多少小时内添加的未完成种子排在下载队列最前（0为关闭）
     
     # 磁盘空间和I/O监控配置
     _enable_disk_monitor = False     # 启用磁盘空间和I/O监控
@@ -191,6 +192,8 @@ class QbOptimizerPlus(_PluginBase):
             self._speed_weight = float(config.get("speed_weight", 1.0))
             self._seeder_weight = float(config.get("seeder_weight", 0.5))
             self._min_score_threshold = float(config.get("min_score_threshold", 1.0))
+            new_first = config.get("new_first_hours")
+            self._new_first_hours = float(new_first) if new_first not in (None, '') else 24.0
             
             # 磁盘空间和I/O监控配置
             self._enable_disk_monitor = config.get("enable_disk_monitor", False)
@@ -969,8 +972,12 @@ class QbOptimizerPlus(_PluginBase):
             else:
                 logger.debug(f"【QB种子优化】跳过非排队状态种子: {torrent.name} (状态: {state_name})")
         
-        queued_torrents = true_queued_torrents
-        logger.info(f"【QB种子优化】真正排队中的种子数量: {len(queued_torrents)}个")
+        fresh = self._fresh_torrents(torrents)
+        fresh_hashes = {t.hash for t in fresh}
+        queued_torrents = [t for t in true_queued_torrents if t.hash not in fresh_hashes]
+        logger.info(f"【QB种子优化】真正排队中的种子数量: {len(true_queued_torrents)}个"
+                    + (f"（其中{len(true_queued_torrents) - len(queued_torrents)}个是新种子，直接排到最前，不再探测）"
+                       if len(queued_torrents) < len(true_queued_torrents) else ""))
         # 按队列顺序排序，确保优先处理排在最前的任务（例如 101、102...）
         try:
             queued_torrents.sort(key=lambda t: self._get_queue_position(t))
@@ -1070,6 +1077,12 @@ class QbOptimizerPlus(_PluginBase):
             for t in sample:
                 logger.info(f"  - {getattr(t, 'name', '')} | state={getattr(t, 'state','')} | seeds={self._get_seeder_count(t)} | raw=[num_seeds={getattr(t,'num_seeds',None)}, seeds={getattr(t,'seeds',None)}, seeders={getattr(t,'seeders',None)}, connected_seeds={getattr(t,'connected_seeds',None)}, num_complete={getattr(t,'num_complete',None)}]")
 
+        # 新种子优先：PT 站新发布的种子做种人数最多、速度最快，按添加时间从旧到新依次置顶，最新的排在最前
+        if fresh:
+            for torrent in sorted(fresh, key=lambda t: self._first_int_attr(t, ['added_on'])):
+                self._set_qb_torrent_priority(downloader_obj, torrent.hash, 1)
+            logger.info(f"【功能3-新种子优先】{len(fresh)}个{self._new_first_hours:g}小时内添加的未完成种子已排到队列最前（最新的在最前）")
+
         # 命中过滤设置的种子（如keep标签）最后置顶，保证排在队列最前
         keep_torrents = [t for t in torrents
                          if getattr(t, 'progress', 0) < 1 and not self._is_paused_state(t) and self._get_exclude_reason(t)]
@@ -1079,6 +1092,15 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"【功能3-综合评分】{len(keep_torrents)}个保持下载的种子已置顶")
 
         return len(high_seed_torrents)
+
+    def _fresh_torrents(self, torrents) -> list:
+        """新种子优先窗口内添加、未完成且未被停止的种子"""
+        if self._new_first_hours <= 0:
+            return []
+        cutoff = time.time() - self._new_first_hours * 3600
+        return [t for t in torrents
+                if getattr(t, 'progress', 0) < 1 and not self._is_paused_state(t)
+                and self._first_int_attr(t, ['added_on']) >= cutoff]
 
     def _process_queued_torrents(self, downloader_obj, queued_torrents, high_seed_torrents):
         """
@@ -4274,6 +4296,28 @@ class QbOptimizerPlus(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
+                                            'model': 'new_first_hours',
+                                            'label': '新种子优先（小时）',
+                                            'placeholder': '24',
+                                            'type': 'number',
+                                            'hint': '这段时间内添加的未完成种子排在下载队列最前，最新的最先下载；0为关闭',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
                                             'model': 'probe_wait_seconds',
                                             'label': '排队种子探测最长等待（秒）',
                                             'placeholder': '30',
@@ -4885,6 +4929,7 @@ class QbOptimizerPlus(_PluginBase):
             "speed_weight": 1.0,
             "seeder_weight": 0.5,
             "min_score_threshold": 1.0,
+            "new_first_hours": 24,
             # 磁盘空间和I/O监控配置
             "enable_disk_monitor": False,
             "disk_space_threshold": 10,
