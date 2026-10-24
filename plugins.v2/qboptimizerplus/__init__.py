@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.10"
+    plugin_version = "1.10.11"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -2142,6 +2142,8 @@ class QbOptimizerPlus(_PluginBase):
         """
         MoviePilot 整理方式为“移动”时，文件移走后 qB 里的已完成种子只剩空壳（无法做种，也会占着列表）。
         对已下载完成、完成超过N分钟、且 MP 整理记录里有移动成功记录的种子，只删除种子记录、不删除任何文件。
+        没有整理记录时，要下载的文件在硬盘上全都不在了（或 qB 最近报告文件不存在），同样只删除种子记录；
+        停止状态的种子不会读文件、qB 不会报错，所以要直接检查硬盘。
         """
         prefix = "【功能8-已整理移走】"
         if not self._enable_moved_clean:
@@ -2168,7 +2170,10 @@ class QbOptimizerPlus(_PluginBase):
             moved = [r for r in records if getattr(r, 'status', False) and (getattr(r, 'mode', '') or '') == 'move']
             if not moved:
                 reason = qb_reasons.get(torrent.name) or {}
-                if reason.get('category') == 'missing' and now - float(reason.get('ts') or 0) < 3600:
+                wanted = [f for f in files if getattr(f, 'priority', 1) != 0]
+                all_gone = bool(wanted) and len(self._missing_file_indexes(torrent, files)) == len(wanted)
+                qb_missing = reason.get('category') == 'missing' and now - float(reason.get('ts') or 0) < 3600
+                if all_gone or qb_missing:
                     try:
                         downloader_obj.qbc.torrents_delete(delete_files=False, torrent_hashes=torrent.hash)
                     except Exception as e:
@@ -2176,7 +2181,8 @@ class QbOptimizerPlus(_PluginBase):
                         continue
                     self._removed_hashes.add(torrent.hash)
                     removed += 1
-                    logger.info(f"{prefix}已完成但文件已不在（qB读取不到，且无整理记录），删除种子记录: {torrent.name}")
+                    why = "硬盘上已没有它的文件" if all_gone else "qB读取不到"
+                    logger.info(f"{prefix}已完成但文件已不在（{why}，且无整理记录），删除种子记录: {torrent.name}")
                     self._events['moved'].append(
                         f"• {self._name(torrent.name)}\n  {StringUtils.str_filesize(getattr(torrent, 'size', 0))} · "
                         f"文件已不在（无整理记录），删除种子记录")
