@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.13"
+    plugin_version = "1.10.14"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1243,6 +1243,7 @@ class QbOptimizerPlus(_PluginBase):
             return None
         max_seeders = None
         working = False
+        unregistered = False
         summary = []
         for tracker in trackers or []:
             url = str(self._tracker_field(tracker, 'url') or '')
@@ -1256,13 +1257,21 @@ class QbOptimizerPlus(_PluginBase):
                 if seeds >= 0:
                     max_seeders = seeds if max_seeders is None else max(max_seeders, seeds)
             msg = self._tracker_field(tracker, 'msg') or ''
+            if self.UNREGISTERED_RE.search(str(msg)):
+                unregistered = True
             host = urlparse(url).netloc or url
             summary.append(f"{host}:{self.TRACKER_STATUS.get(status, status)}{'/' + msg if msg else ''}")
         return {
             'max_seeders': max_seeders,
             'working': working,
+            'unregistered': unregistered,
             'summary': ', '.join(summary) or '无tracker'
         }
+
+    # tracker 明确表示种子已不存在（被站点删除）的返回信息；只认指明「种子」的说法，
+    # 避免把 passkey/用户不存在等账号级错误当成种子被删，导致整站种子被误判
+    UNREGISTERED_RE = re.compile(r'torrent not registered|unregistered torrent|torrent not found|'
+                                 r'种子不存在|种子已被删除|种子未注册', re.I)
 
     def _verify_no_seeders(self, downloader_obj, torrent) -> Tuple[str, str]:
         """
@@ -1290,6 +1299,9 @@ class QbOptimizerPlus(_PluginBase):
             return 'dead', f"tracker报告做种数{status['max_seeders']}，已活跃{active_seconds // 60}分钟"
         if status['working']:
             return 'dead', f"tracker正常但未提供做种统计，活跃{active_seconds // 60}分钟内未连接到做种者"
+        if status['unregistered']:
+            # 站点已删除该种子：不会再有人做种，重新汇报也没用，否则每轮都判成「未就绪」永远卡着
+            return 'dead', f"站点已删除该种子（{status['summary']}）"
         return 'unknown', f"tracker尚未成功返回数据（{status['summary']}）"
 
     def _reannounce(self, downloader_obj, hashes: List[str]):
@@ -1354,9 +1366,12 @@ class QbOptimizerPlus(_PluginBase):
     REPLACEMENT_RETRY_SECONDS = 6 * 3600
     # 无人做种且进度低于此值的种子，找不到替代资源时直接删除（几乎没下到内容，保留只会永远卡着）
     DEAD_DROP_MAX_PROGRESS = 0.01
+    # 直接删除前至少实际活跃这么久：PT 新种刚发布时发种人还没上线、0 做种很常见，不能活跃半小时就删
+    DEAD_DROP_MIN_ACTIVE_SECONDS = 6 * 3600
 
     def _droppable_dead(self, torrent) -> bool:
-        return getattr(torrent, 'progress', 0) < self.DEAD_DROP_MAX_PROGRESS
+        return (getattr(torrent, 'progress', 0) < self.DEAD_DROP_MAX_PROGRESS
+                and self._first_int_attr(torrent, ['time_active']) >= self.DEAD_DROP_MIN_ACTIVE_SECONDS)
 
     def _replacement_cooling_hashes(self, all_torrents) -> set:
         """之前未找到替代资源、仍在重搜冷却期内的种子"""
@@ -3057,7 +3072,9 @@ class QbOptimizerPlus(_PluginBase):
             seeders = self._get_seeder_count(torrent)
             # 死种：无人做种、测过速度且几乎为0。它们不累积等待补偿、也不享受下载中加分，
             # 否则等久了价值会超过真正在下的种子，把快种子挤成暂停、空间预算被死种占满
-            dead = (seeders <= 0 and torrent.hash in speed_ema and speed <= self.DEAD_SPEED_MBPS
+            # qB 自己排队的种子速度本来就是0、tracker 也没汇报，不能据此判成死种
+            queued = 'queued' in (getattr(torrent, 'state', '') or '').lower()
+            dead = (not queued and seeders <= 0 and torrent.hash in speed_ema and speed <= self.DEAD_SPEED_MBPS
                     and self._first_int_attr(torrent, ['time_active']) >= self._seed_check_grace_minutes * 60)
             # 等待补偿：暂停期间按小时累积，恢复后保留到下载完成，避免慢种子永远轮不到
             record = wait_credit.get(torrent.hash) or {'credit': 0.0, 'ts': now}
