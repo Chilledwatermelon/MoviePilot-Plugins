@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.15"
+    plugin_version = "1.10.16"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -1726,7 +1726,8 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"{prefix}删除审计 ({i}/{len(timeout_torrents)}): {torrent.name} | HASH={torrent.hash} | "
                         f"速度={StringUtils.str_filesize(getattr(torrent, 'dlspeed', 0))}/s | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))}")
             ok, failed = self._replace_torrent(
-                downloader_obj, torrent, torrents, f'慢速下载：活跃{active_seconds / 3600:.1f}小时，预计剩余{remaining_text}', prefix)
+                downloader_obj, torrent, torrents, f'慢速下载：活跃{active_seconds / 3600:.1f}小时，预计剩余{remaining_text}', prefix,
+                drop_if_missing=self._droppable_dead(torrent))
             removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
