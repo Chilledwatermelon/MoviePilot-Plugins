@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.12"
+    plugin_version = "1.10.13"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -882,6 +882,13 @@ class QbOptimizerPlus(_PluginBase):
             logger.info(f"{prefix}已让{len(reannounce_hashes)}个做种数据未就绪的种子重新汇报tracker，下次运行再判断")
 
         logger.info(f"{prefix}检查完成: 候选{len(candidates)}个, 确认无人做种{len(zero_seed_torrents)}个")
+        # 先剔除替代资源搜索冷却中、且不能直接删的种子，再按上限截取；
+        # 否则冷却中的种子每轮都占满处理名额，排在后面的永远轮不到
+        cooling = self._replacement_cooling_hashes(torrents)
+        waiting = [t for t in zero_seed_torrents if t.hash in cooling and not self._droppable_dead(t)]
+        if waiting:
+            logger.info(f"{prefix}{len(waiting)}个种子在替代资源搜索冷却中，本轮跳过、不占处理名额")
+            zero_seed_torrents = [t for t in zero_seed_torrents if t not in waiting]
         if len(zero_seed_torrents) > self._max_zero_seed_process:
             logger.info(f"{prefix}超过每次处理上限{self._max_zero_seed_process}，只处理前{self._max_zero_seed_process}个")
             zero_seed_torrents = zero_seed_torrents[:self._max_zero_seed_process]
@@ -893,7 +900,8 @@ class QbOptimizerPlus(_PluginBase):
                         f"进度={getattr(torrent, 'progress', 0) * 100:.1f}% | 大小={StringUtils.str_filesize(getattr(torrent, 'size', 0))} | "
                         f"分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
             ok, failed = self._replace_torrent(
-                downloader_obj, torrent, torrents, f"无人做种（{dead_detail.get(torrent.hash, '')}）", prefix)
+                downloader_obj, torrent, torrents, f"无人做种（{dead_detail.get(torrent.hash, '')}）", prefix,
+                drop_if_missing=self._droppable_dead(torrent))
             removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
@@ -1344,11 +1352,37 @@ class QbOptimizerPlus(_PluginBase):
 
     # 未找到替代资源时，同一种子间隔多久再搜索
     REPLACEMENT_RETRY_SECONDS = 6 * 3600
+    # 无人做种且进度低于此值的种子，找不到替代资源时直接删除（几乎没下到内容，保留只会永远卡着）
+    DEAD_DROP_MAX_PROGRESS = 0.01
 
-    def _replace_torrent(self, downloader_obj, torrent, all_torrents, reason: str, prefix: str) -> Tuple[bool, Optional[dict]]:
+    def _droppable_dead(self, torrent) -> bool:
+        return getattr(torrent, 'progress', 0) < self.DEAD_DROP_MAX_PROGRESS
+
+    def _replacement_cooling_hashes(self, all_torrents) -> set:
+        """之前未找到替代资源、仍在重搜冷却期内的种子"""
+        now = int(time.time())
+        current = {t.hash for t in all_torrents}
+        try:
+            misses = dict(self.get_data('replacement_miss') or {})
+        except Exception:
+            return set()
+        return {h for h, v in misses.items()
+                if h in current and now - (v or {}).get('ts', 0) < self.REPLACEMENT_RETRY_SECONDS}
+
+    def _drop_dead_torrent(self, downloader_obj, torrent, all_torrents, reason: str, why: str, prefix: str) -> bool:
+        logger.info(f"{prefix}{why}，进度{getattr(torrent, 'progress', 0) * 100:.1f}%几乎未下载，直接删除: {torrent.name}")
+        deleted = self._delete_torrent(downloader_obj, torrent, all_torrents, prefix)
+        if deleted:
+            self._events['deleted'].append(
+                f"• {self._name(torrent.name)}\n  {self._brief(self._snapshot_torrent(torrent))}\n  原因：{reason}（{why}）")
+        return deleted
+
+    def _replace_torrent(self, downloader_obj, torrent, all_torrents, reason: str, prefix: str,
+                         drop_if_missing: bool = False) -> Tuple[bool, Optional[dict]]:
         """
         替换一个需要清理的种子：先搜索并提交替代资源，成功后才删除原种子；
         找不到替代资源时保留原种子（进了qB的内容不丢），首次失败时返回通知记录，6小时后再搜。
+        drop_if_missing=True 时（无人做种且几乎没下载），找不到替代资源直接删除原种子。
         未开启自动重新下载时直接删除。返回 (是否删除了原种子, 失败记录或None)。
         """
         if not self._enable_auto_redownload or not self._search_sites:
@@ -1368,6 +1402,12 @@ class QbOptimizerPlus(_PluginBase):
             misses = {}
         miss = misses.get(torrent.hash)
         if miss and now - miss.get('ts', 0) < self.REPLACEMENT_RETRY_SECONDS:
+            if drop_if_missing:
+                deleted = self._drop_dead_torrent(downloader_obj, torrent, all_torrents, reason, "之前未找到替代资源", prefix)
+                if deleted:
+                    misses.pop(torrent.hash, None)
+                    self._save_replacement_misses(misses)
+                return deleted, None
             wait_hours = (self.REPLACEMENT_RETRY_SECONDS - (now - miss['ts'])) / 3600
             logger.info(f"{prefix}之前未找到替代资源，{wait_hours:.1f}小时后再搜，保留原种子: {torrent.name}")
             return False, None
@@ -1400,6 +1440,12 @@ class QbOptimizerPlus(_PluginBase):
                 + ("" if deleted else "\n  （原种子删除失败，请手动处理）"))
             return deleted, None
         fail_reason = detail
+        if drop_if_missing:
+            deleted = self._drop_dead_torrent(downloader_obj, torrent, all_torrents, reason, fail_reason, prefix)
+            if deleted:
+                misses.pop(torrent.hash, None)
+                self._save_replacement_misses(misses)
+                return True, None
 
         first_miss = not miss
         misses[torrent.hash] = {'ts': now, 'count': (miss or {}).get('count', 0) + 1}
@@ -2862,6 +2908,8 @@ class QbOptimizerPlus(_PluginBase):
     WAIT_CREDIT_PER_HOUR = 1.0
     # 从未测到速度的种子（新添加的）按此速度估计，让新种子有机会试速，测到真实速度后以实测为准
     UNKNOWN_SPEED_PRIOR = 1.0
+    # 平滑速度不超过此值（MB/s）且无人做种的视为死种
+    DEAD_SPEED_MBPS = 0.01
 
     @staticmethod
     def _is_downloading_state(torrent) -> bool:
@@ -2989,6 +3037,7 @@ class QbOptimizerPlus(_PluginBase):
         items = []
         info = {}
         oversize = []
+        dead_count = 0
         for torrent in running + paused:
             rinfo = self._remaining_download_info(downloader_obj, torrent)
             if not rinfo or rinfo[0] <= 0:
@@ -3005,21 +3054,33 @@ class QbOptimizerPlus(_PluginBase):
                     speed_ema[torrent.hash] = round(speed, 3)
             else:
                 speed = speed_ema.get(torrent.hash, self.UNKNOWN_SPEED_PRIOR)
+            seeders = self._get_seeder_count(torrent)
+            # 死种：无人做种、测过速度且几乎为0。它们不累积等待补偿、也不享受下载中加分，
+            # 否则等久了价值会超过真正在下的种子，把快种子挤成暂停、空间预算被死种占满
+            dead = (seeders <= 0 and torrent.hash in speed_ema and speed <= self.DEAD_SPEED_MBPS
+                    and self._first_int_attr(torrent, ['time_active']) >= self._seed_check_grace_minutes * 60)
             # 等待补偿：暂停期间按小时累积，恢复后保留到下载完成，避免慢种子永远轮不到
             record = wait_credit.get(torrent.hash) or {'credit': 0.0, 'ts': now}
-            if not is_running:
+            if dead:
+                record['credit'] = 0.0
+            elif not is_running:
                 record['credit'] += self.WAIT_CREDIT_PER_HOUR * max(now - record.get('ts', now), 0) / 3600
             record['ts'] = now
             wait_credit[torrent.hash] = {'credit': round(record['credit'], 3), 'ts': now}
             # 没有速度数据的种子给一个很小的价值，让剩余预算可以分给它们去试速度
-            value = speed + record['credit'] + 0.001 * min(self._get_seeder_count(torrent), 100) + 0.0001
-            if is_running:
+            value = speed + record['credit'] + 0.001 * min(seeders, 100) + 0.0001
+            if is_running and not dead:
                 value = value * self.RUNNING_BONUS + self.RUNNING_MARGIN
             # qB 开启预分配时，启动过的种子已经占好了磁盘空间，继续下载不再消耗剩余空间
             weight = 0.0 if preallocate and self._first_int_attr(torrent, ['time_active']) > 0 else remaining
             if weight and self._enable_moved_clean and files_left > 1:
                 # 目录监控+顺序下载：季包下完一集就被 MP 移走，同时占用的空间约为正在下载的一两集
                 weight = min(weight, largest_file * 2)
+            if dead:
+                # 死种保持运行、不占空间预算：暂停后功能1（只查下载中的种子）就清理不到它们了；
+                # 一旦有人做种或测到速度，下一轮就不再算死种，按真实剩余量重新计入预算
+                weight = 0.0
+                dead_count += 1
             keep_reason = self._get_exclude_reason(torrent)
             if weight > max(budget_bytes, 0):
                 oversize.append((torrent, remaining))
@@ -3030,7 +3091,8 @@ class QbOptimizerPlus(_PluginBase):
         logger.info(f"{prefix}剩余空间 {StringUtils.str_filesize(free_bytes)}，最小阈值 {self._min_disk_space_threshold}GB，"
                     f"可用预算 {StringUtils.str_filesize(max(budget_bytes, 0))}；下载中{len(running)}个"
                     f"（还需{StringUtils.str_filesize(total_running)}），插件暂停{len(paused)}个"
-                    f"{'，qB已开启预分配（已启动过的种子不再计入）' if preallocate else ''}")
+                    f"{'，qB已开启预分配（已启动过的种子不再计入）' if preallocate else ''}"
+                    f"{f'；{dead_count}个无人做种的死种保持运行、不计入预算（交给功能1清理）' if dead_count else ''}")
         new_oversize = [(t, r) for t, r in oversize if t.hash not in oversize_notified]
         for torrent, remaining in oversize:
             logger.warning(f"{prefix}剩余{StringUtils.str_filesize(remaining)}超过可用预算，当前空间下无法下载完成: {torrent.name}")
