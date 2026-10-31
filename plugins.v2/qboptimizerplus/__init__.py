@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.14"
+    plugin_version = "1.10.15"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -3151,6 +3151,14 @@ class QbOptimizerPlus(_PluginBase):
 
         chosen = forced | self._knapsack_select([i for i in items if i[0] not in forced and i[0] not in blocked],
                                                 budget_bytes - forced_weight)
+        # 暂停冷却只用来防止和其它种子来回互换；选完之后预算还有空余时，冷却中的种子可以填进去，
+        # 否则刚暂停的种子要干等30分钟，预算空着、带宽也闲着
+        leftover = budget_bytes - sum(info[h][4] for h in chosen)
+        refill = self._knapsack_select([i for i in items if i[0] in blocked], leftover) if blocked else set()
+        if refill:
+            logger.info(f"{prefix}预算还剩{StringUtils.str_filesize(max(leftover, 0))}，"
+                        f"{len(refill)}个暂停冷却中的种子提前恢复")
+            chosen |= refill
         to_pause = [h for h in info if info[h][3] and h not in chosen]
         to_resume = [h for h in info if not info[h][3] and h in chosen]
         chosen_size = sum(info[h][4] for h in chosen)
