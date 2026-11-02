@@ -40,7 +40,7 @@ class QbOptimizerPlus(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.10.16"
+    plugin_version = "1.10.17"
     # 插件作者
     plugin_author = "Chilledwatermelon"
     # 作者主页
@@ -866,13 +866,16 @@ class QbOptimizerPlus(_PluginBase):
 
         zero_seed_torrents = []
         dead_detail = {}
+        site_gone = set()
         reannounce_hashes = []
         for torrent in candidates:
             verdict, detail = self._verify_no_seeders(downloader_obj, torrent)
-            if verdict == 'dead':
+            if verdict in ('dead', 'gone'):
                 logger.info(f"{prefix}确认无人做种（{detail}）: {torrent.name}")
                 zero_seed_torrents.append(torrent)
                 dead_detail[torrent.hash] = detail
+                if verdict == 'gone':
+                    site_gone.add(torrent.hash)
             else:
                 logger.info(f"{prefix}暂不清理（{detail}）: {torrent.name}")
                 if verdict == 'unknown':
@@ -885,7 +888,8 @@ class QbOptimizerPlus(_PluginBase):
         # 先剔除替代资源搜索冷却中、且不能直接删的种子，再按上限截取；
         # 否则冷却中的种子每轮都占满处理名额，排在后面的永远轮不到
         cooling = self._replacement_cooling_hashes(torrents)
-        waiting = [t for t in zero_seed_torrents if t.hash in cooling and not self._droppable_dead(t)]
+        waiting = [t for t in zero_seed_torrents
+                   if t.hash in cooling and not self._droppable_dead(t, t.hash in site_gone)]
         if waiting:
             logger.info(f"{prefix}{len(waiting)}个种子在替代资源搜索冷却中，本轮跳过、不占处理名额")
             zero_seed_torrents = [t for t in zero_seed_torrents if t not in waiting]
@@ -901,7 +905,7 @@ class QbOptimizerPlus(_PluginBase):
                         f"分类={getattr(torrent, 'category', '')} | 标签={getattr(torrent, 'tags', '')}")
             ok, failed = self._replace_torrent(
                 downloader_obj, torrent, torrents, f"无人做种（{dead_detail.get(torrent.hash, '')}）", prefix,
-                drop_if_missing=self._droppable_dead(torrent))
+                drop_if_missing=self._droppable_dead(torrent, torrent.hash in site_gone))
             removed += int(ok)
             if failed:
                 redownload_failed_torrents.append(failed)
@@ -1276,7 +1280,7 @@ class QbOptimizerPlus(_PluginBase):
     def _verify_no_seeders(self, downloader_obj, torrent) -> Tuple[str, str]:
         """
         复核候选种子是否真的无人做种。
-        返回 (结论, 说明)，结论为 dead / alive / young / unknown。
+        返回 (结论, 说明)，结论为 dead / gone / alive / young / unknown；gone 是站点已删除该种子的 dead。
         """
         active_seconds = self._first_int_attr(torrent, ['time_active'])
         if active_seconds < self._seed_check_grace_minutes * 60:
@@ -1301,7 +1305,7 @@ class QbOptimizerPlus(_PluginBase):
             return 'dead', f"tracker正常但未提供做种统计，活跃{active_seconds // 60}分钟内未连接到做种者"
         if status['unregistered']:
             # 站点已删除该种子：不会再有人做种，重新汇报也没用，否则每轮都判成「未就绪」永远卡着
-            return 'dead', f"站点已删除该种子（{status['summary']}）"
+            return 'gone', f"站点已删除该种子（{status['summary']}）"
         return 'unknown', f"tracker尚未成功返回数据（{status['summary']}）"
 
     def _reannounce(self, downloader_obj, hashes: List[str]):
@@ -1369,8 +1373,9 @@ class QbOptimizerPlus(_PluginBase):
     # 直接删除前至少实际活跃这么久：PT 新种刚发布时发种人还没上线、0 做种很常见，不能活跃半小时就删
     DEAD_DROP_MIN_ACTIVE_SECONDS = 6 * 3600
 
-    def _droppable_dead(self, torrent) -> bool:
-        return (getattr(torrent, 'progress', 0) < self.DEAD_DROP_MAX_PROGRESS
+    def _droppable_dead(self, torrent, site_gone: bool = False) -> bool:
+        # 站点已删除的种子不论进度都永远下不完，找不到替代资源就删，否则每6小时白搜一次、永远占着
+        return ((site_gone or getattr(torrent, 'progress', 0) < self.DEAD_DROP_MAX_PROGRESS)
                 and self._first_int_attr(torrent, ['time_active']) >= self.DEAD_DROP_MIN_ACTIVE_SECONDS)
 
     def _replacement_cooling_hashes(self, all_torrents) -> set:
@@ -1385,7 +1390,7 @@ class QbOptimizerPlus(_PluginBase):
                 if h in current and now - (v or {}).get('ts', 0) < self.REPLACEMENT_RETRY_SECONDS}
 
     def _drop_dead_torrent(self, downloader_obj, torrent, all_torrents, reason: str, why: str, prefix: str) -> bool:
-        logger.info(f"{prefix}{why}，进度{getattr(torrent, 'progress', 0) * 100:.1f}%几乎未下载，直接删除: {torrent.name}")
+        logger.info(f"{prefix}{why}，进度{getattr(torrent, 'progress', 0) * 100:.1f}%，直接删除: {torrent.name}")
         deleted = self._delete_torrent(downloader_obj, torrent, all_torrents, prefix)
         if deleted:
             self._events['deleted'].append(
